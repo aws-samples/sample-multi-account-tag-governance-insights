@@ -417,14 +417,8 @@ class CURCostProvider:
         start_time = datetime.now()
         
         try:
-            logger.info(f"🔍 Executing Athena query '{query_name}'")
-            print(f"📝 SQL Query being executed:")
-            print("-" * 70)
-            query_lines = query.split('\n')
-            for line in query_lines:
-                if line.strip():
-                    print(f"   {line}")
-            print("-" * 70)
+            # Query text is not logged: it contains resource ARNs and tag values.
+            logger.info(f"🔍 Executing Athena query '{query_name}' ({len(query)} chars)")
             
             # Discover workgroup (TagInsights workgroup or fallback to primary)
             workgroup = self._discover_workgroup()

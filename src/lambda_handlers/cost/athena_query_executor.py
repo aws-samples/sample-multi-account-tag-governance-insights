@@ -292,7 +292,7 @@ class AthenaQueryExecutor:
         """
         # Simple hash-based cache key
         import hashlib
-        return hashlib.md5(query.encode()).hexdigest()
+        return hashlib.sha256(query.encode()).hexdigest()
     
     def execute_query_async(self, query: str) -> str:
         """
