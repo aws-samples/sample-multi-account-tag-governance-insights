@@ -1,0 +1,676 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "TagInsights - Core Infrastructure Stack. S3 buckets, Glue database, Athena workgroup, Hub Event Bus, Central Results Queue. No Lambda — pure infrastructure. Deploy this first."
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: ti
+
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, test, cert, uat, staging, prod]
+
+  OrganizationId:
+    Type: String
+    Default: ""
+    Description: >
+      AWS Organization ID (e.g., o-abc123xyz). Required for multi-account deployments.
+      Grants member accounts permission to forward events to the hub event bus and
+      replicate tag deltas to the central analytics bucket.
+    AllowedPattern: "^(o-[a-z0-9]{10,32})?$"
+    ConstraintDescription: "Must be a valid organization ID starting with 'o-' or empty"
+
+  ForceDeleteOnStackRemoval:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Set true to empty and delete all S3 buckets on stack removal.
+      Automatically true for non-prod environments.
+      WARNING: Permanently destroys all tag analytics data.
+
+Conditions:
+  EnableAggressiveCleanup: !Or
+    - !Or
+      - !Equals [!Ref Environment, "dev"]
+      - !Equals [!Ref Environment, "test"]
+      - !Equals [!Ref Environment, "cert"]
+      - !Equals [!Ref Environment, "uat"]
+      - !Equals [!Ref Environment, "staging"]
+    - !Equals [!Ref ForceDeleteOnStackRemoval, "true"]
+
+  HasOrganization: !Not [!Equals [!Ref OrganizationId, ""]]
+
+Resources:
+  # ============================================================================
+  # S3 BUCKETS
+  # ============================================================================
+
+  AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: !If [EnableAggressiveCleanup, Delete, Retain]
+    UpdateReplacePolicy: !If [EnableAggressiveCleanup, Delete, Retain]
+    Properties:
+      BucketName: !Sub "ti-access-logs-${AWS::Region}-${Environment}-${AWS::AccountId}"
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: STANDARD_IA
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 365
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: Application
+          Value: TagInsights
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: AccessLogs
+
+  CentralAnalyticsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: !If [EnableAggressiveCleanup, Delete, Retain]
+    UpdateReplacePolicy: !If [EnableAggressiveCleanup, Delete, Retain]
+    DependsOn: AccessLogsBucket
+    Properties:
+      BucketName: !Sub "ti-central-analytics-${AWS::Region}-${Environment}-${AWS::AccountId}"
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: "central-analytics/"
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldRecent
+            Status: Enabled
+            Prefix: tag-deltas/recent/
+            ExpirationInDays: 95
+          - Id: TransitionHistoricalToIA
+            Status: Enabled
+            Prefix: tag-deltas/historical/
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: STANDARD_IA
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 1
+          - Id: DeleteAggregatorStateOldVersions
+            Status: Enabled
+            Prefix: aggregator-state/
+            NoncurrentVersionExpirationInDays: 7
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: Application
+          Value: TagInsights
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: CentralAnalytics
+
+  CentralAnalyticsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: HasOrganization
+    Properties:
+      Bucket: !Ref CentralAnalyticsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowOrgAccountsToReplicate
+            Effect: Allow
+            Principal:
+              AWS: "*"
+            Action:
+              - s3:ReplicateObject
+              - s3:ReplicateDelete
+              - s3:ReplicateTags
+              - s3:ObjectOwnerOverrideToBucketOwner
+            Resource: !Sub "${CentralAnalyticsBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                "aws:PrincipalOrgID": !Ref OrganizationId
+          - Sid: AllowOrgAccountsReplicationConfig
+            Effect: Allow
+            Principal:
+              AWS: "*"
+            Action:
+              - s3:List*
+              - s3:GetBucketVersioning
+              - s3:GetReplicationConfiguration
+            Resource: !GetAtt CentralAnalyticsBucket.Arn
+            Condition:
+              StringEquals:
+                "aws:PrincipalOrgID": !Ref OrganizationId
+
+  AthenaResultsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: !If [EnableAggressiveCleanup, Delete, Retain]
+    UpdateReplacePolicy: !If [EnableAggressiveCleanup, Delete, Retain]
+    DependsOn: AccessLogsBucket
+    Properties:
+      BucketName: !Sub "ti-athena-results-${AWS::Region}-${Environment}-${AWS::AccountId}"
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: "athena-results/"
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldQueryResults
+            Status: Enabled
+            ExpirationInDays: 7
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: Application
+          Value: TagInsights
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: AthenaResults
+
+  # ============================================================================
+  # BUCKET EMPTIER (non-prod only)
+  # ============================================================================
+
+  BucketEmptierRole:
+    Type: AWS::IAM::Role
+    Condition: EnableAggressiveCleanup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RoleName: !Sub "ti-bucket-emptier-${AWS::Region}-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BucketEmptierPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                  - s3:DeleteObject
+                  - s3:DeleteObjectVersion
+                  - s3:GetBucketVersioning
+                Resource:
+                  - !Sub "arn:aws:s3:::ti-*-${AWS::Region}-${Environment}-${AWS::AccountId}"
+                  - !Sub "arn:aws:s3:::ti-*-${AWS::Region}-${Environment}-${AWS::AccountId}/*"
+
+  BucketEmptierFunction:
+    Type: AWS::Lambda::Function
+    Condition: EnableAggressiveCleanup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      FunctionName: !Sub "ti-bucket-emptier-${Environment}-${AWS::AccountId}"
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt BucketEmptierRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          def empty_bucket(bucket_name):
+              s3 = boto3.client('s3')
+              try:
+                  versioning = s3.get_bucket_versioning(Bucket=bucket_name)
+                  versioned = versioning.get('Status') in ('Enabled', 'Suspended')
+                  if versioned:
+                      paginator = s3.get_paginator('list_object_versions')
+                      for page in paginator.paginate(Bucket=bucket_name):
+                          objects = []
+                          for v in page.get('Versions', []):
+                              objects.append({'Key': v['Key'], 'VersionId': v['VersionId']})
+                          for m in page.get('DeleteMarkers', []):
+                              objects.append({'Key': m['Key'], 'VersionId': m['VersionId']})
+                          if objects:
+                              s3.delete_objects(Bucket=bucket_name, Delete={'Objects': objects})
+                  else:
+                      paginator = s3.get_paginator('list_objects_v2')
+                      for page in paginator.paginate(Bucket=bucket_name):
+                          objects = [{'Key': o['Key']} for o in page.get('Contents', [])]
+                          if objects:
+                              s3.delete_objects(Bucket=bucket_name, Delete={'Objects': objects})
+                  print(f"Emptied bucket: {bucket_name}")
+              except s3.exceptions.NoSuchBucket:
+                  print(f"Bucket {bucket_name} does not exist, skipping")
+              except Exception as e:
+                  print(f"Error emptying {bucket_name}: {e}")
+                  raise
+          def handler(event, context):
+              try:
+                  bucket = event['ResourceProperties']['BucketName']
+                  if event['RequestType'] == 'Delete':
+                      empty_bucket(bucket)
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  print(f"BucketEmptier failed: {e}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  CentralAnalyticsBucketEmptier:
+    Type: Custom::BucketEmptier
+    Condition: EnableAggressiveCleanup
+    DependsOn: CentralAnalyticsBucket
+    Properties:
+      ServiceToken: !GetAtt BucketEmptierFunction.Arn
+      BucketName: !Ref CentralAnalyticsBucket
+
+  AthenaResultsBucketEmptier:
+    Type: Custom::BucketEmptier
+    Condition: EnableAggressiveCleanup
+    DependsOn: AthenaResultsBucket
+    Properties:
+      ServiceToken: !GetAtt BucketEmptierFunction.Arn
+      BucketName: !Ref AthenaResultsBucket
+
+  AccessLogsBucketEmptier:
+    Type: Custom::BucketEmptier
+    Condition: EnableAggressiveCleanup
+    DependsOn: AccessLogsBucket
+    Properties:
+      ServiceToken: !GetAtt BucketEmptierFunction.Arn
+      BucketName: !Ref AccessLogsBucket
+
+  # ============================================================================
+  # GLUE DATABASE + TABLES
+  # ============================================================================
+
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub "ti_${AWS::Region}_${Environment}_${AWS::AccountId}"
+        Description: TagInsights tag analytics database
+        Parameters:
+          project: !Ref ProjectName
+          environment: !Ref Environment
+
+  TagDeltasRecentTable:
+    Type: AWS::Glue::Table
+    DependsOn: [GlueDatabase, CentralAnalyticsBucket]
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: resource_tag_deltas_recent
+        Description: "Recent tag delta records (last 90 days) partitioned by account/date"
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: parquet
+          "parquet.compression": SNAPPY
+        StorageDescriptor:
+          Location: !Sub "s3://${CentralAnalyticsBucket}/tag-deltas/recent/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+            Parameters:
+              serialization.format: "1"
+          Columns:
+            - Name: arn
+              Type: string
+            - Name: resource_type
+              Type: string
+            - Name: tags
+              Type: "map<string,string>"
+            - Name: previous_tags
+              Type: "map<string,string>"
+            - Name: change_type
+              Type: string
+            - Name: timestamp
+              Type: bigint
+            - Name: source_system
+              Type: string
+            - Name: region
+              Type: string
+            - Name: scan_id
+              Type: string
+        PartitionKeys:
+          - Name: account_id
+            Type: string
+          - Name: year
+            Type: int
+          - Name: month
+            Type: int
+          - Name: day
+            Type: int
+
+  TagDeltasHistoricalTable:
+    Type: AWS::Glue::Table
+    DependsOn: [GlueDatabase, CentralAnalyticsBucket]
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: resource_tag_deltas_historical
+        Description: "Aggregated historical tag delta records partitioned by account/month"
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: parquet
+          "parquet.compression": SNAPPY
+        StorageDescriptor:
+          Location: !Sub "s3://${CentralAnalyticsBucket}/tag-deltas/historical/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+            Parameters:
+              serialization.format: "1"
+          Columns:
+            - Name: arn
+              Type: string
+            - Name: resource_type
+              Type: string
+            - Name: tags
+              Type: "map<string,string>"
+            - Name: previous_tags
+              Type: "map<string,string>"
+            - Name: change_type
+              Type: string
+            - Name: first_seen_timestamp
+              Type: bigint
+            - Name: last_seen_timestamp
+              Type: bigint
+            - Name: change_count
+              Type: int
+            - Name: source_system
+              Type: string
+            - Name: region
+              Type: string
+        PartitionKeys:
+          - Name: account_id
+            Type: string
+          - Name: year
+            Type: int
+          - Name: month
+            Type: int
+
+  TagCostsTable:
+    Type: AWS::Glue::Table
+    DependsOn: [GlueDatabase, CentralAnalyticsBucket]
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: tag_costs
+        Description: "Tag-based cost allocation analysis partitioned by account/month"
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: parquet
+          "parquet.compression": SNAPPY
+        StorageDescriptor:
+          Location: !Sub "s3://${CentralAnalyticsBucket}/tag-costs/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+            Parameters:
+              serialization.format: "1"
+          Columns:
+            - Name: tag_key
+              Type: string
+            - Name: tag_value
+              Type: string
+            - Name: is_cost_allocation_tag
+              Type: boolean
+            - Name: resource_arn
+              Type: string
+            - Name: resource_type
+              Type: string
+            - Name: region
+              Type: string
+            - Name: last_month_cost
+              Type: double
+            - Name: current_month_mtd
+              Type: double
+            - Name: current_month_projected
+              Type: double
+            - Name: avg_daily_cost
+              Type: double
+            - Name: analysis_date
+              Type: date
+            - Name: last_updated
+              Type: timestamp
+        PartitionKeys:
+          - Name: account_id
+            Type: string
+          - Name: year
+            Type: int
+          - Name: month
+            Type: int
+
+  # ============================================================================
+  # ATHENA WORKGROUP
+  # ============================================================================
+
+  AthenaWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub "ti-${AWS::Region}-${Environment}-${AWS::AccountId}"
+      Description: TagInsights analytics workgroup
+      State: ENABLED
+      WorkGroupConfiguration:
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${AthenaResultsBucket}/query-results/"
+          EncryptionConfiguration:
+            EncryptionOption: SSE_S3
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+      Tags:
+        - Key: Application
+          Value: TagInsights
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================================================
+  # HUB EVENT BUS
+  # Receives forwarded tag change events from member accounts via EventBridge
+  # cross-account forwarding (event-forwarder-stack.yaml StackSet).
+  # ============================================================================
+
+  HubEventBus:
+    Type: AWS::Events::EventBus
+    DeletionPolicy: !If [EnableAggressiveCleanup, Delete, Retain]
+    UpdateReplacePolicy: !If [EnableAggressiveCleanup, Delete, Retain]
+    Properties:
+      Name: !Sub "${ProjectName}-hub-${Environment}"
+      Tags:
+        - Key: Application
+          Value: TagInsights
+        - Key: Environment
+          Value: !Ref Environment
+
+  HubEventBusPolicy:
+    Type: AWS::Events::EventBusPolicy
+    Condition: HasOrganization
+    Properties:
+      EventBusName: !Ref HubEventBus
+      StatementId: AllowOrgAccountsToForwardEvents
+      Statement:
+        Effect: Allow
+        Principal:
+          AWS: "*"
+        Action: events:PutEvents
+        Resource: !GetAtt HubEventBus.Arn
+        Condition:
+          StringEquals:
+            "aws:PrincipalOrgID": !Ref OrganizationId
+
+  # ============================================================================
+  # CENTRAL RESULTS QUEUE
+  # Analytics Writer Lambda polls this queue to process tag delta notifications.
+  # ============================================================================
+
+  CentralResultQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: !If [EnableAggressiveCleanup, Delete, Retain]
+    UpdateReplacePolicy: !If [EnableAggressiveCleanup, Delete, Retain]
+    Properties:
+      QueueName: !Sub "ti-central-results-${Environment}-${AWS::AccountId}"
+      SqsManagedSseEnabled: true
+      VisibilityTimeout: 1800
+      MessageRetentionPeriod: 1209600
+      ReceiveMessageWaitTimeSeconds: 20
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt CentralResultDLQ.Arn
+        maxReceiveCount: 5
+      Tags:
+        - Key: Application
+          Value: TagInsights
+        - Key: Environment
+          Value: !Ref Environment
+
+  CentralResultDLQ:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: !If [EnableAggressiveCleanup, Delete, Retain]
+    UpdateReplacePolicy: !If [EnableAggressiveCleanup, Delete, Retain]
+    Properties:
+      QueueName: !Sub "ti-central-results-dlq-${Environment}-${AWS::AccountId}"
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600
+      Tags:
+        - Key: Application
+          Value: TagInsights
+        - Key: Environment
+          Value: !Ref Environment
+
+  CentralResultQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref CentralResultQueue
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowSameAccountCrossRegion
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: sqs:SendMessage
+            Resource: !GetAtt CentralResultQueue.Arn
+          - !If
+            - HasOrganization
+            - Sid: AllowOrganizationAccounts
+              Effect: Allow
+              Principal:
+                AWS: "*"
+              Action: sqs:SendMessage
+              Resource: !GetAtt CentralResultQueue.Arn
+              Condition:
+                StringEquals:
+                  "aws:PrincipalOrgID": !Ref OrganizationId
+                StringNotEquals:
+                  "aws:PrincipalAccount": !Ref AWS::AccountId
+            - !Ref AWS::NoValue
+
+  # CloudWatch alarm on DLQ
+  CentralResultDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "ti-central-results-dlq-${Environment}"
+      AlarmDescription: "Tag delta messages failing to process — check Analytics Writer Lambda"
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt CentralResultDLQ.QueueName
+      TreatMissingData: notBreaching
+
+# ============================================================================
+# OUTPUTS — exported for use by aggregator-stack.yaml and other stacks
+# ============================================================================
+
+Outputs:
+  CentralAnalyticsBucketName:
+    Value: !Ref CentralAnalyticsBucket
+    Export:
+      Name: !Sub "ti-central-analytics-bucket-${Environment}"
+
+  CentralAnalyticsBucketArn:
+    Value: !GetAtt CentralAnalyticsBucket.Arn
+    Export:
+      Name: !Sub "ti-central-analytics-bucket-arn-${Environment}"
+
+  AthenaResultsBucketName:
+    Value: !Ref AthenaResultsBucket
+    Export:
+      Name: !Sub "ti-athena-results-bucket-${Environment}"
+
+  GlueDatabaseName:
+    Value: !Ref GlueDatabase
+    Export:
+      Name: !Sub "ti-glue-database-${Environment}"
+
+  AthenaWorkgroupName:
+    Value: !Ref AthenaWorkgroup
+    Export:
+      Name: !Sub "ti-athena-workgroup-${Environment}"
+
+  HubEventBusArn:
+    Value: !GetAtt HubEventBus.Arn
+    Export:
+      Name: !Sub "ti-hub-event-bus-arn-${Environment}"
+
+  HubEventBusName:
+    Value: !Ref HubEventBus
+    Export:
+      Name: !Sub "ti-hub-event-bus-name-${Environment}"
+
+  CentralResultQueueUrl:
+    Value: !Ref CentralResultQueue
+    Export:
+      Name: !Sub "ti-central-results-queue-url-${Environment}"
+
+  CentralResultQueueArn:
+    Value: !GetAtt CentralResultQueue.Arn
+    Export:
+      Name: !Sub "ti-central-results-queue-arn-${Environment}"
+
+  AccessLogsBucketName:
+    Value: !Ref AccessLogsBucket
+    Export:
+      Name: !Sub "ti-access-logs-bucket-${Environment}"

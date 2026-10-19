@@ -1,0 +1,66 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "taginsights-delta-schema",
+  "description": "JSON Schema for TagInsights resource tag delta files (input validation)",
+  "type": "array",
+  "maxItems": 50000,
+  "items": {
+    "type": "object",
+    "required": ["arn", "resource_type", "tags", "previous_tags", "change_type", "timestamp", "account_id", "region"],
+    "additionalProperties": true,
+    "properties": {
+      "arn": {
+        "type": "string",
+        "minLength": 10,
+        "maxLength": 2048,
+        "pattern": "^arn:aws[a-z-]*:[a-z0-9-]+:[a-z0-9-]*:[0-9]*:.+$"
+      },
+      "resource_type": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128
+      },
+      "tags": {
+        "type": "object",
+        "maxProperties": 50,
+        "additionalProperties": {
+          "type": "string",
+          "maxLength": 256
+        }
+      },
+      "previous_tags": {
+        "type": "object",
+        "maxProperties": 50,
+        "additionalProperties": {
+          "type": "string",
+          "maxLength": 256
+        }
+      },
+      "change_type": {
+        "type": "string",
+        "enum": ["new_resource", "tags_changed", "resource_removed"]
+      },
+      "timestamp": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "account_id": {
+        "type": "string",
+        "pattern": "^[0-9]{12}$"
+      },
+      "region": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 64
+      },
+      "source_system": {
+        "type": "string",
+        "maxLength": 64
+      },
+      "scan_id": {
+        "type": "string",
+        "maxLength": 128
+      }
+    }
+  }
+}

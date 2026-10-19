@@ -1,0 +1,177 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "TagInsights - Event Forwarder Stack. Lightweight per-account StackSet template. Forwards tag change events from this member account to the TagInsights hub event bus. No Lambda, no S3, no SQS — only an EventBridge rule and IAM role."
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: ti
+
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, test, cert, uat, staging, prod]
+
+  HubAccountId:
+    Type: String
+    Description: AWS account ID of the TagInsights hub account
+
+  HubRegion:
+    Type: String
+    Default: us-east-1
+    Description: Region where the TagInsights hub event bus is deployed
+
+  EnableEventBridgeExtension:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Enable forwarding for 40+ additional AWS services beyond the core set
+
+Conditions:
+  EnableExtensionCondition: !Equals [!Ref EnableEventBridgeExtension, "true"]
+
+Resources:
+  # ============================================================================
+  # IAM ROLE — allows EventBridge to put events on the hub event bus
+  # ============================================================================
+
+  EventForwarderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-event-forwarder-${AWS::Region}-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EventForwarderPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: !Sub "arn:aws:events:${HubRegion}:${HubAccountId}:event-bus/${ProjectName}-hub-${Environment}"
+
+  # ============================================================================
+  # CORE EVENTBRIDGE FORWARDING RULE
+  # Forwards tag change events from core services to hub
+  # ============================================================================
+
+  CoreTagForwardingRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ProjectName}-forward-core-tags-${AWS::Region}-${Environment}"
+      Description: "Forward core service tag changes to TagInsights hub event bus for centralised processing"
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.ec2
+          - aws.rds
+          - aws.s3
+          - aws.lambda
+          - aws.dynamodb
+          - aws.ecs
+          - aws.eks
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          # Use prefix matching to handle API-versioned event names such as
+          # TagResource20170331v2, CreateTags20150601, etc.
+          eventName:
+            - prefix: CreateTags
+            - prefix: DeleteTags
+            - prefix: TagResource
+            - prefix: UntagResource
+            - prefix: PutBucketTagging
+            - prefix: DeleteBucketTagging
+      Targets:
+        - Arn: !Sub "arn:aws:events:${HubRegion}:${HubAccountId}:event-bus/${ProjectName}-hub-${Environment}"
+          Id: HubEventBusTarget
+          RoleArn: !GetAtt EventForwarderRole.Arn
+
+  # ============================================================================
+  # EXTENDED EVENTBRIDGE FORWARDING RULE (optional — 40+ additional services)
+  # ============================================================================
+
+  ExtendedTagForwardingRule:
+    Type: AWS::Events::Rule
+    Condition: EnableExtensionCondition
+    Properties:
+      Name: !Sub "${ProjectName}-forward-ext-tags-${AWS::Region}-${Environment}"
+      Description: "Forward extended service tag changes to TagInsights hub event bus"
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.elasticache
+          - aws.docdb
+          - aws.neptune-db
+          - aws.redshift
+          - aws.athena
+          - aws.quicksight
+          - aws.emr
+          - aws.es
+          - aws.kafka
+          - aws.timestream
+          - aws.lakeformation
+          - aws.route53
+          - aws.cloudfront
+          - aws.apigateway
+          - aws.directconnect
+          - aws.transitgateway
+          - aws.vpc-lattice
+          - aws.network-firewall
+          - aws.route53resolver
+          - aws.acm
+          - aws.cloudwatch
+          - aws.cloudtrail
+          - aws.config
+          - aws.cloudformation
+          - aws.organizations
+          - aws.budgets
+          - aws.license-manager
+          - aws.backup
+          - aws.codecommit
+          - aws.efs
+          - aws.fsx
+          - aws.bedrock
+          - aws.comprehend
+          - aws.kinesis
+          - aws.dms
+          - aws.datasync
+          - aws.servicecatalog
+          - aws.autoscaling
+          - aws.sqs
+          - aws.sns
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          # Prefix matching handles API-versioned event names (e.g. AddTags20150601)
+          eventName:
+            - prefix: CreateTags
+            - prefix: DeleteTags
+            - prefix: TagResource
+            - prefix: UntagResource
+            - prefix: AddTags
+            - prefix: RemoveTags
+            - prefix: TagQueue
+            - prefix: UntagQueue
+      Targets:
+        - Arn: !Sub "arn:aws:events:${HubRegion}:${HubAccountId}:event-bus/${ProjectName}-hub-${Environment}"
+          Id: HubEventBusExtTarget
+          RoleArn: !GetAtt EventForwarderRole.Arn
+
+Outputs:
+  CoreForwardingRuleArn:
+    Description: Core tag forwarding rule ARN
+    Value: !GetAtt CoreTagForwardingRule.Arn
+
+  HubEventBusTarget:
+    Description: Hub event bus receiving forwarded events
+    Value: !Sub "arn:aws:events:${HubRegion}:${HubAccountId}:event-bus/${ProjectName}-hub-${Environment}"
+
+  DeploymentNote:
+    Description: What this stack deploys
+    Value: "EventBridge forwarding rules only — no Lambda, no S3, no SQS. Negligible cost."

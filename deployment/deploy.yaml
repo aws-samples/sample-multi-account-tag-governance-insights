@@ -1,0 +1,302 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  TagInsights - Top-level deployment orchestrator.
+  Deploys core-stack.yaml then aggregator-stack.yaml, with optional
+  cost-analysis-stack.yaml. The event-forwarder-stack.yaml StackSet
+  must be deployed separately to member accounts via CloudFormation StackSets.
+
+  Prerequisites:
+    1. AWS Resource Explorer must be enabled org-wide (Systems Manager Quick Setup
+       or manually: local indexes in all accounts + aggregator index in hub account).
+    2. If EnableRealTimeEvents=true, deploy event-forwarder-stack.yaml as a StackSet
+       to all member accounts after this stack completes.
+
+  Deployment order (handled automatically by DependsOn):
+    1. core-stack.yaml  (S3, Glue, Athena, Event Bus, SQS)
+    2. aggregator-stack.yaml  (Coordinator, Worker, Analytics Writer Lambdas)
+    3. cost-analysis-stack.yaml  (optional, CUR-based cost allocation)
+
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, test, cert, uat, staging, prod]
+    Description: Environment name — affects resource naming and retention policies
+
+  LambdaCodeBucket:
+    Type: String
+    Description: S3 bucket name containing pre-built Lambda deployment packages (e.g., my-taginsights-bucket)
+
+  OrganizationId:
+    Type: String
+    Default: ""
+    AllowedPattern: "^(o-[a-z0-9]{10,32})?$"
+    ConstraintDescription: "Must be a valid organization ID starting with 'o-' or empty"
+    Description: >
+      AWS Organization ID (e.g., o-abc123xyz). Required for multi-account deployments.
+      Grants member accounts permission to forward events to the hub and replicate tag data.
+
+  HubRegion:
+    Type: String
+    Default: us-east-1
+    AllowedValues:
+      - us-east-1
+      - us-east-2
+      - us-west-1
+      - us-west-2
+      - eu-west-1
+      - eu-west-2
+      - eu-central-1
+      - ap-southeast-1
+      - ap-southeast-2
+      - ap-northeast-1
+      - ca-central-1
+    Description: Hub region where the Resource Explorer aggregator index is configured
+
+  ScanSchedule:
+    Type: String
+    Default: "cron(0 2 * * ? *)"
+    Description: >
+      Scan schedule for the orches. Default: daily at 2 AM UTC.
+      The orches processes all org accounts sequentially, checkpointing progress.
+      For very large orgs (>10k account-regions), fan-out activates automatically
+      after MaxScanDays. Use cron(0 2 ? * SUN *) for weekly scans.
+
+  MaxScanDays:
+    Type: Number
+    Default: 3
+    Description: >
+      Days allowed for a full baseline scan to complete sequentially before fan-out kicks in.
+      After the initial baseline, daily incremental scans complete in one invocation.
+
+  EnableRealTimeEvents:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Enable real-time tag change detection via cross-account EventBridge forwarding.
+      Requires event-forwarder-stack.yaml deployed as a StackSet to member accounts.
+
+  EnableEventBridgeExtension:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Enable forwarding for 40+ additional AWS services beyond the core set
+
+  EnableCostAnalysis:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Enable tag-based cost analysis using AWS Cost and Usage Reports (CUR).
+      Requires Athena CUR integration to be set up separately.
+
+  LogLevel:
+    Type: String
+    Default: WARNING
+    AllowedValues: [DEBUG, INFO, WARNING, ERROR]
+    Description: Lambda log level. WARNING minimizes CloudWatch Logs cost in production.
+
+  ForceDeleteOnStackRemoval:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      WARNING: Permanently destroys all tag analytics data on stack removal.
+      Automatically true for non-prod environments. Only set true for prod if
+      intentionally tearing down completely (e.g., end of PoC).
+
+  # ── Optional CUR parameters (cost analysis only) ──────────────────────────
+
+  CurDatabaseName:
+    Type: String
+    Default: ""
+    Description: Glue database name for the CUR table (e.g., athenacurcfn_cur)
+
+  CurTableName:
+    Type: String
+    Default: ""
+    Description: Glue table name for CUR data (e.g., cur)
+
+  CurBucketName:
+    Type: String
+    Default: "not-configured"
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+    ConstraintDescription: "Must be a valid S3 bucket name (required when EnableCostAnalysis=true)"
+    Description: >
+      S3 bucket name where CUR data is stored. Required when EnableCostAnalysis=true.
+      IAM access is scoped to this specific bucket.
+
+  CurAccountRoleArn:
+    Type: String
+    Default: ""
+    AllowedPattern: "^(arn:aws:iam::[0-9]{12}:role/.+)?$"
+    Description: >
+      IAM role ARN for cross-account CUR access. Leave empty when CUR is in
+      the same account as the hub.
+
+  CurExternalId:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: >
+      External ID for cross-account CUR role assumption. Required when
+      CurAccountRoleArn is configured.
+
+  CurAthenaResultsBucket:
+    Type: String
+    Default: ""
+    Description: >
+      Optional Athena results bucket in the CUR account. Leave empty to use
+      the existing TagInsights Athena results bucket.
+
+  DeploymentVersion:
+    Type: String
+    AllowedPattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+    ConstraintDescription: >
+      Must be 1-64 letters, numbers, dots, underscores, or hyphens.
+    Description: Immutable version segment for nested templates and versioned artifacts.
+
+  CheckpointSigningSecret:
+    Type: String
+    NoEcho: true
+    Description: >
+      HMAC secret for checkpoint integrity. Required.
+      Generate with 'openssl rand -hex 32'.
+
+Conditions:
+  EnableCostAnalysisCondition: !Equals [!Ref EnableCostAnalysis, "true"]
+
+Resources:
+  # ============================================================================
+  # 1. CORE INFRASTRUCTURE
+  # S3 buckets, Glue database, Athena workgroup, Hub Event Bus, Central SQS Queue
+  # ============================================================================
+
+  CoreStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "https://s3.amazonaws.com/${LambdaCodeBucket}/templates/v${DeploymentVersion}/core-stack.yaml"
+      Parameters:
+        ProjectName: ti
+        Environment: !Ref Environment
+        OrganizationId: !Ref OrganizationId
+        ForceDeleteOnStackRemoval: !Ref ForceDeleteOnStackRemoval
+      Tags:
+        - Key: Application
+          Value: TagInsights
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: Core
+
+  # ============================================================================
+  # 2. AGGREGATOR (Coordinator + Worker + Analytics Writer Lambdas)
+  # ============================================================================
+
+  AggregatorStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: CoreStack
+    Properties:
+      TemplateURL: !Sub "https://s3.amazonaws.com/${LambdaCodeBucket}/templates/v${DeploymentVersion}/aggregator-stack.yaml"
+      Parameters:
+        ProjectName: ti
+        Environment: !Ref Environment
+        LambdaCodeBucket: !Ref LambdaCodeBucket
+        DeploymentVersion: !Ref DeploymentVersion
+        HubRegion: !Ref HubRegion
+        ScanSchedule: !Ref ScanSchedule
+        MaxScanDays: !Ref MaxScanDays
+        EnableRealTimeEvents: !Ref EnableRealTimeEvents
+        EnableEventBridgeExtension: !Ref EnableEventBridgeExtension
+        LogLevel: !Ref LogLevel
+        CheckpointSigningSecret: !Ref CheckpointSigningSecret
+        ForceDeleteOnStackRemoval: !Ref ForceDeleteOnStackRemoval
+      Tags:
+        - Key: Application
+          Value: TagInsights
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: Aggregator
+
+  # ============================================================================
+  # 3. COST ANALYSIS (optional)
+  # ============================================================================
+  # ============================================================================
+
+  CostAnalysisStack:
+    Type: AWS::CloudFormation::Stack
+    Condition: EnableCostAnalysisCondition
+    DependsOn: CoreStack
+    Properties:
+      TemplateURL: !Sub "https://s3.amazonaws.com/${LambdaCodeBucket}/templates/v${DeploymentVersion}/cost-analysis-stack.yaml"
+      Parameters:
+        ProjectName: ti
+        Environment: !Ref Environment
+        LambdaCodeBucket: !Ref LambdaCodeBucket
+        CurDatabaseName: !Ref CurDatabaseName
+        CurTableName: !Ref CurTableName
+        CurBucketName: !Ref CurBucketName
+        CurAccountRoleArn: !Ref CurAccountRoleArn
+        CurExternalId: !Ref CurExternalId
+        CurAthenaResultsBucket: !Ref CurAthenaResultsBucket
+        DeploymentVersion: !Ref DeploymentVersion
+      Tags:
+        - Key: Application
+          Value: TagInsights
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: CostAnalysis
+
+# ============================================================================
+# OUTPUTS
+# ============================================================================
+
+Outputs:
+  DeploymentComplete:
+    Description: Deployment status
+    Value: "TagInsights deployed successfully"
+
+  NextStep:
+    Description: Required next step for multi-account real-time detection
+    Value: !If
+      - EnableCostAnalysisCondition
+      - "Deploy event-forwarder-stack.yaml as a StackSet to member accounts. See docs/DEPLOYMENT.md."
+      - "If EnableRealTimeEvents=true, deploy event-forwarder-stack.yaml as a StackSet to member accounts. See docs/DEPLOYMENT.md."
+
+  CentralAnalyticsBucket:
+    Description: Central analytics S3 bucket
+    Value: !GetAtt CoreStack.Outputs.CentralAnalyticsBucketName
+
+  GlueDatabase:
+    Description: Glue database for Athena queries
+    Value: !GetAtt CoreStack.Outputs.GlueDatabaseName
+
+  AthenaWorkgroup:
+    Description: Athena workgroup
+    Value: !GetAtt CoreStack.Outputs.AthenaWorkgroupName
+
+  CoordinatorLambda:
+    Description: Coordinator Lambda ARN
+    Value: !GetAtt AggregatorStack.Outputs.CoordinatorLambdaArn
+
+  WorkerLambda:
+    Description: Worker Lambda ARN
+    Value: !GetAtt AggregatorStack.Outputs.WorkerLambdaArn
+
+  ScanSchedule:
+    Description: Configured scan schedule
+    Value: !Ref ScanSchedule
+
+  HubEventBusArn:
+    Description: Hub event bus ARN (use in event-forwarder-stack.yaml StackSet parameters)
+    Value: !GetAtt CoreStack.Outputs.HubEventBusArn
+
+  FeaturesEnabled:
+    Description: Optional features enabled in this deployment
+    Value: !Sub
+      - "CostAnalysis=${Cost}, RealTimeEvents=${RT}"
+      - Cost: !Ref EnableCostAnalysis
+        RT: !Ref EnableRealTimeEvents

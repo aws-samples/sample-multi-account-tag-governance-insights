@@ -1,0 +1,992 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "TagInsights - Aggregator Stack. Coordinator + Worker Lambdas for org-wide tag scanning via Resource Explorer aggregator. Analytics Writer Lambda processes deltas into Parquet. Prerequisite: core-stack.yaml must be deployed first."
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: ti
+
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, test, cert, uat, staging, prod]
+
+  LambdaCodeBucket:
+    Type: String
+    Description: S3 bucket containing pre-built Lambda deployment packages
+
+  DeploymentVersion:
+    Type: String
+    AllowedPattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+    ConstraintDescription: >
+      Must be 1-64 letters, numbers, dots, underscores, or hyphens.
+    Description: Immutable version segment shared by all Lambda ZIPs.
+
+  HubRegion:
+    Type: String
+    Default: us-east-1
+    Description: Region where the Resource Explorer aggregator index is configured
+
+  ScanSchedule:
+    Type: String
+    Default: "cron(0 2 * * ? *)"
+    Description: >
+      Daily scan schedule. Default is 2 AM UTC every day.
+      The orches processes accounts sequentially within the 15-minute Lambda window,
+      resuming from a checkpoint on subsequent days if the org is too large to finish in one run.
+      Use cron(0 2 ? * SUN *) for weekly scans on very large orgs.
+
+  MaxScanDays:
+    Type: Number
+    Default: 3
+    Description: >
+      Maximum days allowed for a full baseline scan to complete sequentially.
+      If exceeded, the orches automatically fans out parallel workers per account
+      to catch up. After the initial baseline, daily incremental scans rarely need fan-out.
+
+  EnableRealTimeEvents:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Enable real-time tag change detection via forwarded EventBridge events.
+      Requires event-forwarder-stack.yaml deployed as a StackSet to member accounts.
+      When false, the aggregator runs scheduled scans only (lower cost, higher latency).
+
+  EnableEventBridgeExtension:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Enable forwarding for 40+ additional AWS services beyond the core set
+
+  CheckpointSigningSecret:
+    Type: String
+    NoEcho: true
+    Description: >
+      Secret used to HMAC-sign scan checkpoints (tamper detection).
+      Required. Generate with 'openssl rand -hex 32'.
+
+  LogLevel:
+    Type: String
+    Default: WARNING
+    AllowedValues: [DEBUG, INFO, WARNING, ERROR]
+    Description: Lambda log level. WARNING recommended for production to minimize CloudWatch Logs cost.
+
+  ForceDeleteOnStackRemoval:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+
+Conditions:
+  EnableAggressiveCleanup: !Or
+    - !Or
+      - !Equals [!Ref Environment, "dev"]
+      - !Equals [!Ref Environment, "test"]
+      - !Equals [!Ref Environment, "cert"]
+      - !Equals [!Ref Environment, "uat"]
+      - !Equals [!Ref Environment, "staging"]
+    - !Equals [!Ref ForceDeleteOnStackRemoval, "true"]
+
+  EnableRealTimeEventsCondition: !Equals [!Ref EnableRealTimeEvents, "true"]
+  EnableExtensionCondition: !And
+    - !Condition EnableRealTimeEventsCondition
+    - !Equals [!Ref EnableEventBridgeExtension, "true"]
+
+  # Code signing enforced on prod only — dev/test/cert/uat/staging can deploy unsigned for velocity
+  IsProduction: !Equals [!Ref Environment, "prod"]
+
+Resources:
+  # ============================================================================
+  # IAM ROLE — COORDINATOR LAMBDA
+  # Lists accounts, reads/writes scan checkpoint, invokes Worker Lambdas.
+  # ============================================================================
+
+  CoordinatorRole:
+    Type: AWS::IAM::Role
+    DeletionPolicy: !If [EnableAggressiveCleanup, Delete, Retain]
+    UpdateReplacePolicy: !If [EnableAggressiveCleanup, Delete, Retain]
+    Properties:
+      RoleName: !Sub "${ProjectName}-orches-${AWS::Region}-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CoordinatorPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # List all accounts in org (primary method)
+              - Effect: Allow
+                Action:
+                  - organizations:ListAccounts
+                  - organizations:DescribeOrganization
+                Resource: "*"
+              # RE index list (fallback account discovery if not management account)
+              - Effect: Allow
+                Action:
+                  - resource-explorer-2:ListIndexes
+                Resource: "*"
+              # Read/write scan checkpoint and aggregator state in central bucket
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub
+                    - "${BucketArn}"
+                    - BucketArn: !ImportValue
+                        Fn::Sub: "ti-central-analytics-bucket-arn-${Environment}"
+                  - !Sub
+                    - "${BucketArn}/*"
+                    - BucketArn: !ImportValue
+                        Fn::Sub: "ti-central-analytics-bucket-arn-${Environment}"
+              # Invoke Worker Lambda (fan-out when MaxScanDays exceeded)
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt WorkerLambda.Arn
+              # CloudWatch metrics
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: "*"
+
+  # ============================================================================
+  # IAM ROLE — WORKER LAMBDA
+  # Scans one account+region via RE aggregator, writes deltas to S3.
+  # ============================================================================
+
+  WorkerRole:
+    Type: AWS::IAM::Role
+    DeletionPolicy: !If [EnableAggressiveCleanup, Delete, Retain]
+    UpdateReplacePolicy: !If [EnableAggressiveCleanup, Delete, Retain]
+    Properties:
+      RoleName: !Sub "${ProjectName}-worker-${AWS::Region}-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: WorkerPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Resource Explorer — org-wide search via aggregator index
+              - Effect: Allow
+                Action:
+                  - resource-explorer-2:Search
+                  - resource-explorer-2:ListResources
+                  - resource-explorer-2:ListIndexes
+                  - resource-explorer-2:ListViews
+                  - resource-explorer-2:GetIndex
+                  - resource-explorer-2:ListSupportedResourceTypes
+                Resource: "*"
+              # Read previous state + write deltas to central analytics bucket
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub
+                    - "${BucketArn}"
+                    - BucketArn: !ImportValue
+                        Fn::Sub: "ti-central-analytics-bucket-arn-${Environment}"
+                  - !Sub
+                    - "${BucketArn}/*"
+                    - BucketArn: !ImportValue
+                        Fn::Sub: "ti-central-analytics-bucket-arn-${Environment}"
+              # Send delta notifications to central results queue → triggers Analytics Writer
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:GetQueueUrl
+                  - sqs:GetQueueAttributes
+                Resource:
+                  - !ImportValue
+                    Fn::Sub: "ti-central-results-queue-arn-${Environment}"
+              # CloudWatch metrics
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: "*"
+
+  # ============================================================================
+  # IAM ROLE — ANALYTICS WRITER LAMBDA
+  # Reads delta notifications from central results queue, writes Parquet to S3.
+  # ============================================================================
+
+  AnalyticsWriterRole:
+    Type: AWS::IAM::Role
+    DeletionPolicy: !If [EnableAggressiveCleanup, Delete, Retain]
+    UpdateReplacePolicy: !If [EnableAggressiveCleanup, Delete, Retain]
+    Properties:
+      RoleName: !Sub "${ProjectName}-analytics-${AWS::Region}-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AnalyticsWriterPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Read deltas + write Parquet to central analytics bucket
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:HeadObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub
+                    - "${BucketArn}"
+                    - BucketArn: !ImportValue
+                        Fn::Sub: "ti-central-analytics-bucket-arn-${Environment}"
+                  - !Sub
+                    - "${BucketArn}/*"
+                    - BucketArn: !ImportValue
+                        Fn::Sub: "ti-central-analytics-bucket-arn-${Environment}"
+              # SQS — receive from central results queue
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:SendMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:GetQueueUrl
+                Resource:
+                  - !ImportValue
+                    Fn::Sub: "ti-central-results-queue-arn-${Environment}"
+              # Glue partition management for Athena query availability
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetTable
+                  - glue:UpdateTable
+                  - glue:GetPartition
+                  - glue:CreatePartition
+                  - glue:BatchCreatePartition
+                  - glue:UpdatePartition
+                Resource:
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                  - !Sub
+                    - "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${DbName}"
+                    - DbName: !ImportValue
+                        Fn::Sub: "ti-glue-database-${Environment}"
+                  - !Sub
+                    - "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${DbName}/*"
+                    - DbName: !ImportValue
+                        Fn::Sub: "ti-glue-database-${Environment}"
+              # CloudWatch metrics
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: "*"
+
+  # ============================================================================
+  # SQS BUFFER FOR REAL-TIME FORWARDED EVENTS
+  # EventBridge → SQS → Worker Lambda (rate-controlled via ESM MaxConcurrency)
+  # Only created when EnableRealTimeEvents=true
+  # ============================================================================
+
+  ForwardedEventsDLQ:
+    Type: AWS::SQS::Queue
+    Condition: EnableRealTimeEventsCondition
+    DeletionPolicy: !If [EnableAggressiveCleanup, Delete, Retain]
+    UpdateReplacePolicy: !If [EnableAggressiveCleanup, Delete, Retain]
+    Properties:
+      QueueName: !Sub "${ProjectName}-forwarded-events-dlq-${Environment}"
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600
+      Tags:
+        - Key: Application
+          Value: TagInsights
+        - Key: Environment
+          Value: !Ref Environment
+
+  ForwardedEventsQueue:
+    Type: AWS::SQS::Queue
+    Condition: EnableRealTimeEventsCondition
+    DeletionPolicy: !If [EnableAggressiveCleanup, Delete, Retain]
+    UpdateReplacePolicy: !If [EnableAggressiveCleanup, Delete, Retain]
+    Properties:
+      QueueName: !Sub "${ProjectName}-forwarded-events-${Environment}"
+      SqsManagedSseEnabled: true
+      VisibilityTimeout: 1800
+      MessageRetentionPeriod: 86400
+      ReceiveMessageWaitTimeSeconds: 20
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ForwardedEventsDLQ.Arn
+        maxReceiveCount: 3
+      Tags:
+        - Key: Application
+          Value: TagInsights
+        - Key: Environment
+          Value: !Ref Environment
+
+  ForwardedEventsQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Condition: EnableRealTimeEventsCondition
+    Properties:
+      Queues:
+        - !Ref ForwardedEventsQueue
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowHubEventBusToSendMessages
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt ForwardedEventsQueue.Arn
+            Condition:
+              ArnEquals:
+                "aws:SourceArn": !Sub
+                  - "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/${BusName}/${ProjectName}-forwarded-tag-changes-${Environment}"
+                  - BusName: !ImportValue
+                      Fn::Sub: "ti-hub-event-bus-name-${Environment}"
+
+  # Add SQS send permission to WorkerRole for real-time events path
+  WorkerRoleSQSPolicy:
+    Type: AWS::IAM::RolePolicy
+    Condition: EnableRealTimeEventsCondition
+    Properties:
+      RoleName: !Ref WorkerRole
+      PolicyName: WorkerSQSPolicy
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - sqs:ReceiveMessage
+              - sqs:DeleteMessage
+              - sqs:GetQueueAttributes
+            Resource: !GetAtt ForwardedEventsQueue.Arn
+
+  # ============================================================================
+  # LAMBDA CODE SIGNING (PRODUCTION ONLY)
+  # Enforces that only cryptographically signed packages can be deployed to prod.
+  # Dev/test/cert/uat/staging environments skip signing for deployment velocity.
+  #
+  # ONE-TIME SETUP (per region, per account) before first prod deployment:
+  #   aws signer put-signing-profile \
+  #     --profile-name taginsights-lambda-signer \
+  #     --platform-id AWSLambda-SHA384-ECDSA \
+  #     --signature-validity-period value=365,type=DAYS
+  # ============================================================================
+
+  LambdaCodeSigningConfig:
+    Type: AWS::Lambda::CodeSigningConfig
+    Condition: IsProduction
+    Properties:
+      Description: !Sub "TagInsights Lambda code signing enforcement — ${Environment}"
+      AllowedPublishers:
+        SigningProfileVersionArns:
+          - !Sub "arn:aws:signer:${AWS::Region}:${AWS::AccountId}:/signing-profiles/taginsights-lambda-signer"
+      CodeSigningPolicies:
+        # Enforce: reject unsigned or tampered code from deploying to prod
+        # This blocks insider code injection — only CI/CD-signed packages are accepted
+        UntrustedArtifactOnDeployment: Enforce
+      Tags:
+        - Key: Application
+          Value: TagInsights
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: SecurityControl
+          Value: "CodeSigning"
+
+  # ============================================================================
+  # LAMBDA FUNCTIONS
+  # ============================================================================
+
+  CoordinatorLambda:
+    Type: AWS::Lambda::Function
+    DeletionPolicy: !If [EnableAggressiveCleanup, Delete, Retain]
+    UpdateReplacePolicy: !If [EnableAggressiveCleanup, Delete, Retain]
+    Properties:
+      FunctionName: !Sub "${ProjectName}-orches-${Environment}-${AWS::AccountId}"
+      Runtime: python3.11
+      Handler: aggregator_coordinator.lambda_handler
+      Role: !GetAtt CoordinatorRole.Arn
+      Timeout: 900
+      MemorySize: 512
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+          HUB_REGION: !Ref HubRegion
+          CENTRAL_ANALYTICS_BUCKET: !ImportValue
+            Fn::Sub: "ti-central-analytics-bucket-${Environment}"
+          WORKER_FUNCTION_NAME: !Ref WorkerLambda
+          MAX_SCAN_DAYS: !Ref MaxScanDays
+          LOG_LEVEL: !Ref LogLevel
+          CHECKPOINT_SIGNING_SECRET: !Ref CheckpointSigningSecret
+      # Prod: use signed package from CI/CD pipeline. Non-prod: unsigned for velocity.
+      CodeSigningConfigArn:
+        !If [IsProduction, !Ref LambdaCodeSigningConfig, !Ref AWS::NoValue]
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !If
+          - IsProduction
+          - !Sub "signed/v${DeploymentVersion}/aggregator_coordinator.zip"
+          - !Sub "lambda-packages/v${DeploymentVersion}/aggregator_coordinator.zip"
+      Tags:
+        - Key: Application
+          Value: TagInsights
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: Coordinator
+
+  WorkerLambda:
+    Type: AWS::Lambda::Function
+    DeletionPolicy: !If [EnableAggressiveCleanup, Delete, Retain]
+    UpdateReplacePolicy: !If [EnableAggressiveCleanup, Delete, Retain]
+    Properties:
+      FunctionName: !Sub "${ProjectName}-worker-${Environment}-${AWS::AccountId}"
+      Runtime: python3.11
+      Handler: aggregator_worker.lambda_handler
+      Role: !GetAtt WorkerRole.Arn
+      Timeout: 900
+      MemorySize: 512
+      ReservedConcurrentExecutions: 20
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+          HUB_REGION: !Ref HubRegion
+          CENTRAL_ANALYTICS_BUCKET: !ImportValue
+            Fn::Sub: "ti-central-analytics-bucket-${Environment}"
+          CENTRAL_RESULTS_QUEUE_URL: !ImportValue
+            Fn::Sub: "ti-central-results-queue-url-${Environment}"
+          LOG_LEVEL: !Ref LogLevel
+      CodeSigningConfigArn:
+        !If [IsProduction, !Ref LambdaCodeSigningConfig, !Ref AWS::NoValue]
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !If
+          - IsProduction
+          - !Sub "signed/v${DeploymentVersion}/aggregator_worker.zip"
+          - !Sub "lambda-packages/v${DeploymentVersion}/aggregator_worker.zip"
+      Tags:
+        - Key: Application
+          Value: TagInsights
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: Worker
+
+  AnalyticsWriterLambda:
+    Type: AWS::Lambda::Function
+    DeletionPolicy: !If [EnableAggressiveCleanup, Delete, Retain]
+    UpdateReplacePolicy: !If [EnableAggressiveCleanup, Delete, Retain]
+    Properties:
+      FunctionName: !Sub "${ProjectName}-analytics-${Environment}-${AWS::AccountId}"
+      Runtime: python3.11
+      Handler: analytics_writer_handler.lambda_handler
+      Role: !GetAtt AnalyticsWriterRole.Arn
+      Timeout: 300
+      MemorySize: 1024
+      ReservedConcurrentExecutions: 20
+      Layers:
+        - !Sub "arn:aws:lambda:${AWS::Region}:336392948345:layer:AWSSDKPandas-Python311:13"
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+          HUB_REGION: !Ref AWS::Region
+          CENTRAL_ANALYTICS_BUCKET: !ImportValue
+            Fn::Sub: "ti-central-analytics-bucket-${Environment}"
+          ATHENA_DATABASE: !ImportValue
+            Fn::Sub: "ti-glue-database-${Environment}"
+          ATHENA_WORKGROUP: !ImportValue
+            Fn::Sub: "ti-athena-workgroup-${Environment}"
+          ATHENA_RESULTS_BUCKET: !ImportValue
+            Fn::Sub: "ti-athena-results-bucket-${Environment}"
+          LOG_LEVEL: !Ref LogLevel
+      CodeSigningConfigArn:
+        !If [IsProduction, !Ref LambdaCodeSigningConfig, !Ref AWS::NoValue]
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !If
+          - IsProduction
+          - !Sub "signed/v${DeploymentVersion}/analytics_writer.zip"
+          - !Sub "lambda-packages/v${DeploymentVersion}/analytics_writer.zip"
+      Tags:
+        - Key: Application
+          Value: TagInsights
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: AnalyticsWriter
+
+  # Analytics Writer triggered by central results queue
+  AnalyticsWriterEventMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !ImportValue
+        Fn::Sub: "ti-central-results-queue-arn-${Environment}"
+      FunctionName: !Ref AnalyticsWriterLambda
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 5
+      Enabled: true
+      ScalingConfig:
+        MaximumConcurrency: 20
+
+  # Worker triggered by forwarded events queue (real-time mode only)
+  ForwardedEventsEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Condition: EnableRealTimeEventsCondition
+    DependsOn: WorkerRoleSQSPolicy
+    Properties:
+      EventSourceArn: !GetAtt ForwardedEventsQueue.Arn
+      FunctionName: !Ref WorkerLambda
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 5
+      Enabled: true
+      ScalingConfig:
+        MaximumConcurrency: 20
+
+  # ============================================================================
+  # EVENTBRIDGE RULES
+  # ============================================================================
+
+  # Scheduled daily scan — triggers orches
+  ScanScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ProjectName}-scan-schedule-${Environment}"
+      Description: !Sub "TagInsights daily scan (${ScanSchedule}). Coordinator processes org accounts sequentially, resuming from checkpoint if needed."
+      State: ENABLED
+      ScheduleExpression: !Ref ScanSchedule
+      Targets:
+        - Arn: !GetAtt CoordinatorLambda.Arn
+          Id: CoordinatorScanTarget
+          RetryPolicy:
+            MaximumEventAgeInSeconds: 3600
+            MaximumRetryAttempts: 0
+          Input: '{"trigger_source": "scheduled_scan"}'
+
+  ScanSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CoordinatorLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScanScheduleRule.Arn
+
+  # Real-time tag change forwarding rule (HubAggregatorWithEvents mode)
+  # Routes events from hub event bus → SQS buffer → Worker Lambda
+  ForwardedEventsRule:
+    Type: AWS::Events::Rule
+    Condition: EnableRealTimeEventsCondition
+    Properties:
+      Name: !Sub "${ProjectName}-forwarded-tag-changes-${Environment}"
+      Description: "Buffer forwarded tag change events in SQS for controlled Worker Lambda processing"
+      State: ENABLED
+      EventBusName: !ImportValue
+        Fn::Sub: "ti-hub-event-bus-name-${Environment}"
+      EventPattern:
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventName:
+            - prefix: CreateTags
+            - prefix: DeleteTags
+            - prefix: TagResource
+            - prefix: UntagResource
+            - prefix: PutBucketTagging
+            - prefix: DeleteBucketTagging
+            - prefix: AddTags
+            - prefix: RemoveTags
+            - prefix: TagQueue
+            - prefix: UntagQueue
+      Targets:
+        - Arn: !GetAtt ForwardedEventsQueue.Arn
+          Id: ForwardedEventsSQSTarget
+
+  # ============================================================================
+  # CLOUDWATCH ALARMS
+  # ============================================================================
+
+  CoordinatorErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-orches-errors-${Environment}"
+      AlarmDescription: "Coordinator Lambda errors — scan may be stalled"
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CoordinatorLambda
+      TreatMissingData: notBreaching
+
+  CoordinatorTimeoutAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-orches-timeout-${Environment}"
+      AlarmDescription: "Coordinator Lambda approaching timeout — org scan may be very large"
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Maximum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 840000
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CoordinatorLambda
+      TreatMissingData: notBreaching
+
+  WorkerErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-worker-errors-${Environment}"
+      AlarmDescription: "Worker Lambda errors during account scan"
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref WorkerLambda
+      TreatMissingData: notBreaching
+
+  WorkerTimeoutAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-worker-timeout-${Environment}"
+      AlarmDescription: "Worker Lambda approaching timeout — account may have too many resources, check sharding"
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Maximum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 840000
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref WorkerLambda
+      TreatMissingData: notBreaching
+
+  ForwardedEventsDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableRealTimeEventsCondition
+    Properties:
+      AlarmName: !Sub "${ProjectName}-forwarded-events-dlq-${Environment}"
+      AlarmDescription: "Forwarded tag change events failing permanently and landing in DLQ"
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt ForwardedEventsDLQ.QueueName
+      TreatMissingData: notBreaching
+
+  # ============================================================================
+  # CLOUDWATCH LOG GROUPS
+  # ============================================================================
+
+  CoordinatorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${CoordinatorLambda}"
+      RetentionInDays: 7
+      Tags:
+        - Key: Application
+          Value: TagInsights
+        - Key: Environment
+          Value: !Ref Environment
+
+  WorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${WorkerLambda}"
+      RetentionInDays: 7
+      Tags:
+        - Key: Application
+          Value: TagInsights
+        - Key: Environment
+          Value: !Ref Environment
+
+  AnalyticsWriterLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AnalyticsWriterLambda}"
+      RetentionInDays: 14
+      Tags:
+        - Key: Application
+          Value: TagInsights
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================================================
+  # MONTHLY AGGREGATOR
+  # Compresses 90-day-old daily partitions into monthly summaries in
+  # resource_tag_deltas_historical. Reduces partition count 90x and
+  # saves storage/query cost. Runs on day 2 of each month at 3 AM UTC.
+  # ============================================================================
+
+  MonthlyAggregatorRole:
+    Type: AWS::IAM::Role
+    DeletionPolicy: !If [EnableAggressiveCleanup, Delete, Retain]
+    UpdateReplacePolicy: !If [EnableAggressiveCleanup, Delete, Retain]
+    Properties:
+      RoleName: !Sub "${ProjectName}-monthly-agg-${AWS::Region}-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: MonthlyAggregatorPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Read daily partitions + write/delete monthly partitions in central bucket
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub
+                    - "${BucketArn}"
+                    - BucketArn: !ImportValue
+                        Fn::Sub: "ti-central-analytics-bucket-arn-${Environment}"
+                  - !Sub
+                    - "${BucketArn}/*"
+                    - BucketArn: !ImportValue
+                        Fn::Sub: "ti-central-analytics-bucket-arn-${Environment}"
+              # Athena query execution for account discovery + daily data reads
+              - Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                  - athena:StopQueryExecution
+                  - athena:GetWorkGroup
+                Resource:
+                  - !Sub
+                    - "arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${Wg}"
+                    - Wg: !ImportValue
+                        Fn::Sub: "ti-athena-workgroup-${Environment}"
+              # Athena results bucket
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub "arn:aws:s3:::ti-athena-results-${AWS::Region}-${Environment}-${AWS::AccountId}"
+                  - !Sub "arn:aws:s3:::ti-athena-results-${AWS::Region}-${Environment}-${AWS::AccountId}/*"
+              # Glue — read recent + read/write/delete historical table partitions
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetPartition
+                  - glue:GetPartitions
+                  - glue:CreatePartition
+                  - glue:BatchCreatePartition
+                  - glue:DeletePartition
+                  - glue:BatchDeletePartition
+                  - glue:UpdatePartition
+                Resource:
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                  - !Sub
+                    - "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${Db}"
+                    - Db: !ImportValue
+                        Fn::Sub: "ti-glue-database-${Environment}"
+                  - !Sub
+                    - "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${Db}/*"
+                    - Db: !ImportValue
+                        Fn::Sub: "ti-glue-database-${Environment}"
+              # CloudWatch metrics
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: "*"
+
+  MonthlyAggregatorLambda:
+    Type: AWS::Lambda::Function
+    DeletionPolicy: !If [EnableAggressiveCleanup, Delete, Retain]
+    UpdateReplacePolicy: !If [EnableAggressiveCleanup, Delete, Retain]
+    Properties:
+      FunctionName: !Sub "${ProjectName}-monthly-agg-${Environment}-${AWS::AccountId}"
+      Runtime: python3.11
+      Handler: monthly_aggregator_handler.lambda_handler
+      Role: !GetAtt MonthlyAggregatorRole.Arn
+      Timeout: 900
+      MemorySize: 2048
+      Layers:
+        - !Sub "arn:aws:lambda:${AWS::Region}:336392948345:layer:AWSSDKPandas-Python311:13"
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+          CENTRAL_ANALYTICS_BUCKET: !ImportValue
+            Fn::Sub: "ti-central-analytics-bucket-${Environment}"
+          ATHENA_RESULTS_BUCKET: !Sub "ti-athena-results-${AWS::Region}-${Environment}-${AWS::AccountId}"
+          ATHENA_DATABASE: !ImportValue
+            Fn::Sub: "ti-glue-database-${Environment}"
+          ATHENA_WORKGROUP: !ImportValue
+            Fn::Sub: "ti-athena-workgroup-${Environment}"
+          RETENTION_DAYS: "90"
+          LOG_LEVEL: !Ref LogLevel
+      CodeSigningConfigArn:
+        !If [IsProduction, !Ref LambdaCodeSigningConfig, !Ref AWS::NoValue]
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !If
+          - IsProduction
+          - !Sub "signed/v${DeploymentVersion}/monthly_aggregator.zip"
+          - !Sub "lambda-packages/v${DeploymentVersion}/monthly_aggregator.zip"
+      Tags:
+        - Key: Application
+          Value: TagInsights
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: MonthlyAggregator
+
+  MonthlyAggregationScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ProjectName}-monthly-aggregation-${Environment}"
+      Description: "TagInsights monthly aggregation — compresses 90-day-old daily partitions into monthly summaries (day 2 of each month, 3 AM UTC)"
+      State: ENABLED
+      ScheduleExpression: "cron(0 3 2 * ? *)"
+      Targets:
+        - Arn: !GetAtt MonthlyAggregatorLambda.Arn
+          Id: MonthlyAggregatorTarget
+          RetryPolicy:
+            MaximumEventAgeInSeconds: 3600
+            MaximumRetryAttempts: 1
+          Input: '{"operation": "aggregate", "trigger_source": "monthly_schedule"}'
+
+  MonthlyAggregationPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref MonthlyAggregatorLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt MonthlyAggregationScheduleRule.Arn
+
+  MonthlyAggregatorErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-monthly-agg-errors-${Environment}"
+      AlarmDescription: "Monthly Aggregator Lambda errors — historical partition compression may be failing"
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 900
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref MonthlyAggregatorLambda
+      TreatMissingData: notBreaching
+
+  MonthlyAggregatorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${MonthlyAggregatorLambda}"
+      RetentionInDays: 30
+      Tags:
+        - Key: Application
+          Value: TagInsights
+        - Key: Environment
+          Value: !Ref Environment
+
+# ============================================================================
+# OUTPUTS
+# ============================================================================
+
+Outputs:
+  CoordinatorLambdaArn:
+    Value: !GetAtt CoordinatorLambda.Arn
+    Export:
+      Name: !Sub "${ProjectName}-orches-lambda-${Environment}"
+
+  WorkerLambdaArn:
+    Value: !GetAtt WorkerLambda.Arn
+    Export:
+      Name: !Sub "${ProjectName}-worker-lambda-${Environment}"
+
+  AnalyticsWriterLambdaArn:
+    Value: !GetAtt AnalyticsWriterLambda.Arn
+    Export:
+      Name: !Sub "${ProjectName}-analytics-lambda-${Environment}"
+
+  ScanSchedule:
+    Value: !Ref ScanSchedule
+    Export:
+      Name: !Sub "${ProjectName}-scan-schedule-${Environment}"
+
+  RealTimeEventsEnabled:
+    Value: !Ref EnableRealTimeEvents
+
+  MonthlyAggregatorLambdaArn:
+    Value: !GetAtt MonthlyAggregatorLambda.Arn
+    Export:
+      Name: !Sub "${ProjectName}-monthly-agg-lambda-${Environment}"
+
+  ForwardedEventsQueueArn:
+    Condition: EnableRealTimeEventsCondition
+    Value: !GetAtt ForwardedEventsQueue.Arn
+    Export:
+      Name: !Sub "${ProjectName}-forwarded-events-queue-arn-${Environment}"

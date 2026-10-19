@@ -1,0 +1,12 @@
+# Lambda-specific requirements for TagInsights
+# These are the core dependencies needed by the Lambda functions
+
+# Logging and utilities (required - not in Lambda runtime)
+loguru>=0.6.0
+
+# JSON schema validation for delta files (guards against malicious injection)
+# Gracefully disabled if not present (see analytics_writer_handler.py HAS_JSONSCHEMA flag)
+jsonschema>=4.17.0
+
+# Note: boto3, botocore, json, typing, os, sys, time, datetime are included in Lambda runtime
+# Note: numpy, pandas, pyarrow are provided by AWS Lambda Layer (AWSSDKPandas-Python311)

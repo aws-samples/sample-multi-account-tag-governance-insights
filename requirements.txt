@@ -1,0 +1,13 @@
+# Local development and tests.
+# Lambda runtime deps (packaged into each function zip)
+-r deployment/requirements-lambda.txt
+
+# Provided by the Lambda runtime
+boto3>=1.26.0
+botocore
+
+# Provided in Lambda by the AWSSDKPandas-Python311 layer
+pandas>=2.0.0
+pyarrow>=14.0.0
+
+pytest
