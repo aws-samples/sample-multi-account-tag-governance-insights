@@ -647,7 +647,7 @@ class CURSchemaManager:
             FROM {database}.{table} 
             WHERE {partition_filter}
             LIMIT 1
-            """
+            """  # nosec B608 - database/table must exist in Glue (get_table); partition filter built from datetime
             
             # Get Athena results bucket
             results_bucket = (

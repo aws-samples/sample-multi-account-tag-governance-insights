@@ -17,10 +17,18 @@ Fast deployment with pre-configured CloudFormation links.
 
 ### Steps 1-2: Build, upload, and deploy
 
-Follow [DEPLOYMENT.md](DEPLOYMENT.md) Step 1 (build and upload) and Step 2
-(create the root `deploy.yaml` stack). Deploy the root stack, not individual
-nested templates: `core-stack.yaml` on its own creates storage only, not the
-scanner.
+Follow [DEPLOYMENT.md](DEPLOYMENT.md) Step 1 (build and upload all 9 Lambda
+packages) and Step 2 (create the root `deploy.yaml` stack). Deploy the root
+stack, not individual nested templates: `core-stack.yaml` on its own creates
+storage only, not the scanner.
+
+> **Prerequisite: access-log bucket.** The root stack requires
+> `AccessLogsBucketName`: an existing S3 bucket for server access logs, usually
+> your logging baseline's bucket (AWS Control Tower or Landing Zone Accelerator).
+> S3 requires it in the same account and Region, encrypted with SSE-S3 (not
+> SSE-KMS), with a bucket policy granting `s3:PutObject` to
+> `logging.s3.amazonaws.com`
+> ([S3 docs](https://docs.aws.amazon.com/AmazonS3/latest/userguide/enable-server-access-logging.html)).
 
 ### Step 3: Trigger initial scan
 

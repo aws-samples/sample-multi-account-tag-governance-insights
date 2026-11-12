@@ -196,13 +196,15 @@ Hub Account (TagInsights Lambda)
 ### Step 1 — Deploy the cost analysis stack with all cross-account CUR parameters
 
 ```bash
+CUR_EXTERNAL_ID=$(openssl rand -hex 16)   # keep it; Step 2 uses the same value
+
 aws cloudformation update-stack \
   --stack-name TagInsights \
   --use-previous-template \
   --parameters \
       ParameterKey=EnableCostAnalysis,ParameterValue=true \
       ParameterKey=CurAccountRoleArn,ParameterValue=arn:aws:iam::<BILLING_ACCOUNT_ID>:role/taginsights-cur-reader \
-      ParameterKey=CurExternalId,ParameterValue=<EXTERNAL_ID> \
+      ParameterKey=CurExternalId,ParameterValue=${CUR_EXTERNAL_ID} \
       ParameterKey=CurDatabaseName,ParameterValue=<GLUE_DATABASE_NAME> \
       ParameterKey=CurTableName,ParameterValue=<GLUE_TABLE_NAME> \
       ParameterKey=CurBucketName,ParameterValue=<CUR_BUCKET_NAME> \
@@ -211,6 +213,7 @@ aws cloudformation update-stack \
       ParameterKey=DeploymentVersion,UsePreviousValue=true \
       ParameterKey=HubRegion,UsePreviousValue=true \
       ParameterKey=OrganizationId,UsePreviousValue=true \
+      ParameterKey=AccessLogsBucketName,UsePreviousValue=true \
       ParameterKey=CheckpointSigningSecret,UsePreviousValue=true \
   --capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
   --region ${REGION} --profile ${AWS_PROFILE}
@@ -222,6 +225,8 @@ others you set at creation.
 | Parameter           | Description                                                 |
 |---------------------|-------------------------------------------------------------|
 | `CurAccountRoleArn` | ARN of the role you will create in Step 2 (billing account) |
+| `CurExternalId`     | Random external ID; required with `CurAccountRoleArn` and matched by the Step 2 trust policy |
+| `CurBucketName`     | S3 bucket holding the CUR data (IAM access is scoped to it) |
 | `CurDatabaseName`   | Glue database name (e.g. `athenacurcfn_cur`)                |
 | `CurTableName`      | Glue table name (e.g. `cur`)                                |
 
@@ -240,7 +245,10 @@ Create a role named `taginsights-cur-reader` in your billing/CUR account.
       "Principal": {
         "AWS": "<ARN of the Cost Worker Lambda execution role in hub account>"
       },
-      "Action": "sts:AssumeRole"
+      "Action": "sts:AssumeRole",
+      "Condition": {
+        "StringEquals": { "sts:ExternalId": "<CUR_EXTERNAL_ID from Step 1>" }
+      }
     }
   ]
 }
@@ -349,6 +357,7 @@ aws cloudformation update-stack \
       ParameterKey=DeploymentVersion,UsePreviousValue=true \
       ParameterKey=HubRegion,UsePreviousValue=true \
       ParameterKey=OrganizationId,UsePreviousValue=true \
+      ParameterKey=AccessLogsBucketName,UsePreviousValue=true \
       ParameterKey=CheckpointSigningSecret,UsePreviousValue=true \
   --capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
   --region ${REGION} --profile ${AWS_PROFILE}

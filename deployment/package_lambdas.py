@@ -19,6 +19,19 @@ from typing import Dict, List, Optional, Tuple
 import json
 
 
+
+def run_argv(argv, **kwargs):
+    """
+    subprocess.run for an argument list only: refuses a string command and
+    shell=True, so nothing this build starts can reach a shell. (pip has no
+    supported Python API; a subprocess is the supported way to call it:
+    https://pip.pypa.io/en/stable/user_guide/#using-pip-from-your-program)
+    """
+    if isinstance(argv, (str, bytes)) or kwargs.get("shell"):
+        raise ValueError("an argument list only, and no shell")
+    call = [list(argv)]
+    return subprocess.run(*call, **kwargs)
+
 class LambdaPackager:
     """Packages TagInsights code for Lambda deployment."""
     
@@ -80,6 +93,16 @@ class LambdaPackager:
                 'handler_file': 'cost/cost_deduplicator_handler.py',
                 'handler_name': 'lambda_handler',
                 'description': 'Cost Deduplicator for consolidating daily partitions into monthly archives'
+            },
+            'tag_compliance_rule': {
+                'handler_file': 'tag_compliance_rule.py',
+                'handler_name': 'lambda_handler',
+                'description': 'Organization custom Config rule validating required, allowed, and multi-value tags'
+            },
+            'tag_compliance_report': {
+                'handler_file': 'tag_compliance_report.py',
+                'handler_name': 'lambda_handler',
+                'description': 'Daily tag compliance report from the Config aggregator via Amazon SES'
             }
         }
 
@@ -245,7 +268,7 @@ class LambdaPackager:
         
         if requirements_file.exists():
             # Install dependencies directly to the package root for Lambda.
-            subprocess.run([
+            run_argv([
                 sys.executable, '-m', 'pip', 'install',
                 '-r', str(requirements_file),
                 '-t', str(temp_path),

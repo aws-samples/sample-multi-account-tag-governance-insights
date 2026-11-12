@@ -9,6 +9,8 @@ import gzip
 import json
 import os
 import sys
+
+import pytest
 from unittest.mock import patch, MagicMock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -62,8 +64,8 @@ class TestReadState:
 
         assert state == existing_state
 
-    def test_s3_error_returns_empty_dict(self):
-        """Non-NoSuchKey S3 errors return {} rather than raising."""
+    def test_s3_error_raises(self):
+        """Non-NoSuchKey S3 errors raise: an unreadable state must not be treated as empty."""
         mock_s3 = _make_s3_mock()
         mock_s3.get_object.side_effect = ClientError(
             {"Error": {"Code": "ServiceUnavailable", "Message": "Try later"}},
@@ -71,9 +73,8 @@ class TestReadState:
         )
 
         with patch.object(worker, "s3", mock_s3):
-            state = worker.read_state("123456789012", "us-east-1")
-
-        assert state == {}
+            with pytest.raises(ClientError):
+                worker.read_state("123456789012", "us-east-1")
 
     def test_read_state_uses_correct_key_format(self):
         """read_state calls s3.get_object with the expected key pattern."""

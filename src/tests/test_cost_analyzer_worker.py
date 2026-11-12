@@ -270,18 +270,20 @@ class TestCreateTagRow:
             "resource_type": "EC2",
             "region": "us-east-1",
         }
-        # The matcher returns the current month's cost so far as "monthly_cost"
         cost_data = {"monthly_cost": 30.0}
-        row = worker._create_tag_row(resource, "env", "prod", True, cost_data)
-        today = date.today()
-        days_in_month = calendar.monthrange(today.year, today.month)[1]
+        worker.months_back = 1
+        today = date(2026, 11, 10)
+        with patch.object(worker_module, "date") as mock_date:
+            mock_date.today.return_value = today
+            row = worker._create_tag_row(resource, "env", "prod", True, cost_data)
         assert row["tag_key"] == "env"
         assert row["tag_value"] == "prod"
         assert row["is_cost_allocation_tag"] is True
+        # MONTHS_BACK=1 queries the current month, so the cost is month-to-date.
         assert row["current_month_mtd"] == 30.0
         assert row["last_month_cost"] == 0.0
-        assert row["avg_daily_cost"] == pytest.approx(30.0 / today.day)
-        assert row["current_month_projected"] == pytest.approx(30.0 / today.day * days_in_month)
+        assert row["avg_daily_cost"] == pytest.approx(3.0)            # 30 / 10 days
+        assert row["current_month_projected"] == pytest.approx(90.0)  # 3.0 * 30 days
         assert row["analysis_date"] == today
 
     def test_without_cost_data(self, env_vars, mock_deps):

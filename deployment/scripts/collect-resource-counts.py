@@ -13,15 +13,14 @@ Usage:
     python3 collect-resource-counts.py --output counts.csv --regions us-east-1,us-west-2
 
 Requirements:
-    - AWS CLI installed and configured
+    - boto3 and AWS credentials (run in the Resource Explorer aggregator Region)
     - Resource Explorer enabled with indexes in target regions
-    - IAM permissions: resource-explorer-2:Search
+    - IAM permissions: resource-explorer-2:ListResources
 
-Cost: $0 (Resource Explorer Search API is free)
+Cost: $0 (Resource Explorer ListResources is free)
 """
 
-import subprocess
-import json
+import boto3
 import csv
 import sys
 import argparse
@@ -51,40 +50,31 @@ def parse_arn(arn):
         return None, None
 
 
-def run_resource_explorer_search(next_token=None, accounts_filter=None, regions_filter=None):
+def build_filter_strings(accounts_filter=None, regions_filter=None):
     """
-    Execute AWS Resource Explorer search using AWS CLI.
-    Returns JSON response.
+    ListResources ANDs every filter term and has no OR, so each
+    account/region combination is listed with its own filter string.
     """
-    cmd = ['aws', 'resource-explorer-2', 'search', '--query-string', '*']
-    
-    # Add filters if specified
-    if accounts_filter or regions_filter:
-        query_parts = []
-        if accounts_filter:
-            account_queries = [f'accountid:{acc}' for acc in accounts_filter]
-            query_parts.append(f"({' OR '.join(account_queries)})")
-        if regions_filter:
-            region_queries = [f'region:{reg}' for reg in regions_filter]
-            query_parts.append(f"({' OR '.join(region_queries)})")
-        
-        query_string = ' AND '.join(query_parts)
-        cmd[cmd.index('*')] = query_string
-    
-    if next_token:
-        cmd.extend(['--next-token', next_token])
-    
-    cmd.extend(['--output', 'json'])
-    
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        return json.loads(result.stdout)
-    except subprocess.CalledProcessError as e:
-        print(f"ERROR: AWS CLI command failed: {e.stderr}", file=sys.stderr)
-        sys.exit(1)
-    except json.JSONDecodeError as e:
-        print(f"ERROR: Failed to parse AWS CLI output: {e}", file=sys.stderr)
-        sys.exit(1)
+    accounts = accounts_filter or [None]
+    regions = regions_filter or [None]
+    return [
+        " ".join(t for t in (f"accountid:{a}" if a else "", f"region:{r}" if r else "") if t)
+        for a in accounts for r in regions
+    ]
+
+
+def iter_resource_pages(accounts_filter=None, regions_filter=None):
+    """
+    Page through every matching resource with ListResources. (Search is not
+    used: it returns at most 1,000 results per query, which undercounts.)
+    """
+    client = boto3.client("resource-explorer-2")
+    paginator = client.get_paginator("list_resources")
+    for filter_string in build_filter_strings(accounts_filter, regions_filter):
+        kwargs = {"MaxResults": 1000}
+        if filter_string:
+            kwargs["Filters"] = {"FilterString": filter_string}
+        yield from paginator.paginate(**kwargs)
 
 
 def collect_resource_counts(accounts_filter=None, regions_filter=None):
@@ -95,24 +85,19 @@ def collect_resource_counts(accounts_filter=None, regions_filter=None):
     Returns: dict mapping (account_id, region) -> resource_count
     """
     counts = defaultdict(int)
-    next_token = None
     total_resources = 0
     page_num = 0
     
     print("Collecting resource counts from AWS Resource Explorer...")
     print("This may take 5-10 minutes for large environments (100M+ resources)...")
     
-    while True:
+    for response in iter_resource_pages(accounts_filter, regions_filter):
         page_num += 1
-        print(f"  Fetching page {page_num}...", end='', flush=True)
-        
-        response = run_resource_explorer_search(next_token, accounts_filter, regions_filter)
-        
         resources = response.get('Resources', [])
         page_count = len(resources)
         total_resources += page_count
         
-        print(f" {page_count} resources (total: {total_resources:,})")
+        print(f"  Page {page_num}: {page_count} resources (total: {total_resources:,})")
         
         # Aggregate counts in memory
         for resource in resources:
@@ -122,11 +107,7 @@ def collect_resource_counts(accounts_filter=None, regions_filter=None):
             if account_id and region:
                 key = (account_id, region)
                 counts[key] += 1
-        
-        # Check for next page
-        next_token = response.get('NextToken')
-        if not next_token:
-            break
+
     
     print(f"\n✓ Processed {total_resources:,} resources")
     print(f"✓ Found {len(counts)} unique account-region combinations")
@@ -215,7 +196,7 @@ Examples:
     write_csv(counts, args.output)
     
     print(f"\nCompleted in {duration:.1f} seconds")
-    print(f"Cost: $0 (Resource Explorer Search API is free)")
+    print(f"Cost: $0 (Resource Explorer ListResources is free)")
 
 
 if __name__ == '__main__':

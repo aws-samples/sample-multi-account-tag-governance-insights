@@ -22,6 +22,10 @@ LAMBDA_TEMPLATES = {
             "cost_deduplicator",
         ),
     ),
+    "TagComplianceStack": (
+        REPOSITORY_ROOT / "deployment" / "tag-compliance-stack.yaml",
+        ("tag_compliance_rule", "tag_compliance_report"),
+    ),
 }
 
 
@@ -117,14 +121,16 @@ def test_nested_template_combines_cur_security_and_compatibility_contracts():
 
     assert 'arn:aws:s3:::${CurBucketName}' in template
     assert "aws-cost-and-usage-*" not in template
-    assert "SqsManagedSseEnabled: true" in template
+    assert "KmsMasterKeyId: alias/aws/sqs" in template  # SSE-KMS on cost queues
     assert template.count("aws:SourceAccount: !Ref AWS::AccountId") >= 3
 
 
 def test_root_forwards_deployment_version_to_every_lambda_stack():
     template = ROOT_TEMPLATE.read_text(encoding="utf-8")
 
-    for stack_name in LAMBDA_TEMPLATES:
+    # tag-compliance-stack.yaml is deployed standalone in the Config delegated
+    # administrator account, not nested under deploy.yaml.
+    for stack_name in (n for n in LAMBDA_TEMPLATES if n != "TagComplianceStack"):
         next_resource = {
             "AggregatorStack": "CostAnalysisStack",
             "CostAnalysisStack": "DeploymentComplete",
@@ -153,7 +159,7 @@ def test_all_lambda_artifact_keys_are_versioned_and_immutable():
                 f'{function_name}.zip"'
             ) in template
 
-    assert len(expected_functions) == 7
+    assert len(expected_functions) == 9
 
 
 def test_deployed_worker_shape_and_named_resources_are_unchanged():

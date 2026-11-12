@@ -30,9 +30,143 @@ import re
 
 _ARN_RE = re.compile(
     r"^arn:(aws|aws-cn|aws-us-gov):[a-zA-Z0-9*-]+:"
-    r"[a-z0-9*-]*:\d{12}:[A-Za-z0-9][A-Za-z0-9._:/+=,@-]{0,1023}$"
+    # Account is optional (S3: arn:aws:s3:::name) and the resource may start
+    # with '/' (API Gateway: arn:aws:apigateway:us-east-1::/apis/id).
+    r"[a-z0-9*-]*:(?:\d{12})?:[A-Za-z0-9/][A-Za-z0-9._:/+=,@-]{0,1023}$"
 )
 _RESOURCE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+=,@-]{0,1023}$")
+
+# CUR product_servicename substring per TagInsights service type.
+SERVICE_NAME_PATTERNS = {
+    'ec2': 'Amazon Elastic Compute Cloud',
+    's3': 'Amazon Simple Storage Service', 
+    'rds': 'Amazon Relational Database Service',
+    'lambda': 'AWS Lambda',
+    'ecs': 'Amazon EC2 Container Service',
+    'elb': 'Elastic Load Balancing',
+    'elasticache': 'Amazon ElastiCache',
+    'dynamodb': 'Amazon DynamoDB',
+    'sqs': 'Amazon Simple Queue Service',
+    'sns': 'Amazon Simple Notification Service',
+    'kms': 'AWS Key Management Service',
+    'secretsmanager': 'AWS Secrets Manager',
+    'secrets-manager': 'AWS Secrets Manager',
+    'acm': 'AWS Certificate Manager',
+    'certificate-manager': 'AWS Certificate Manager',
+    'cognito': 'Amazon Cognito',
+    'sagemaker': 'Amazon SageMaker',
+    'glue': 'AWS Glue',
+    'comprehend': 'Amazon Comprehend',
+    'bedrock': 'Amazon Bedrock Service',
+    'kendra': 'Amazon Kendra',
+    'elasticsearch': 'Amazon Elasticsearch Service',
+    'es': 'Amazon Elasticsearch Service',
+    'opensearch': 'Amazon OpenSearch Service',
+    'cloudformation': 'AWS CloudFormation',
+    'cloudtrail': 'AWS CloudTrail',
+    'logs': 'AmazonCloudWatch',
+    'cloudwatch-logs': 'AmazonCloudWatch',
+    'cloudwatch': 'AmazonCloudWatch',
+    'systems-manager': 'AWS Systems Manager',
+    'ssm': 'AWS Systems Manager',
+    'batch': 'AWS Batch',
+    'efs': 'Amazon Elastic File System',
+    'fsx': 'Amazon FSx',
+    'redshift': 'Amazon Redshift',
+    'documentdb': 'Amazon DocumentDB',
+    'docdb': 'Amazon DocumentDB',
+    'neptune': 'Amazon Neptune',
+    'qldb': 'Amazon QLDB',
+    'timestream': 'Amazon Timestream',
+    'cloudfront': 'Amazon CloudFront',
+    'route53': 'Amazon Route 53',
+    'nat-gateway': 'Amazon Virtual Private Cloud',
+    'natgw': 'Amazon Virtual Private Cloud',
+    'vpc-endpoint': 'Amazon Virtual Private Cloud',
+    'vpce': 'Amazon Virtual Private Cloud',
+    'elastic-ip': 'Amazon Virtual Private Cloud',
+    'eip': 'Amazon Virtual Private Cloud',
+    'transit-gateway': 'AWS Transit Gateway',
+    'tgw': 'AWS Transit Gateway',
+    'direct-connect': 'AWS Direct Connect',
+    'dx': 'AWS Direct Connect',
+    'vpn': 'Amazon Virtual Private Cloud',
+    'globalaccelerator': 'AWS Global Accelerator',
+    'waf': 'AWS WAF',
+    'emr': 'Amazon Elastic MapReduce',
+    'kinesis': 'Amazon Kinesis',
+    'kinesis-data-streams': 'Amazon Kinesis',
+    'kinesis-firehose': 'Amazon Kinesis Firehose',
+    'firehose': 'Amazon Kinesis Firehose',
+    'kinesis-analytics': 'Amazon Kinesis Analytics',
+    'kinesisanalytics': 'Amazon Kinesis Analytics',
+    'apigateway': 'Amazon API Gateway',
+    'api-gateway': 'Amazon API Gateway',
+    'appsync': 'AWS AppSync',
+    'stepfunctions': 'AWS Step Functions',
+    'step-functions': 'AWS Step Functions',
+    'codebuild': 'AWS CodeBuild',
+    'codedeploy': 'AWS CodeDeploy',
+    'codepipeline': 'AWS CodePipeline',
+    'codecommit': 'AWS CodeCommit',
+    'cloud9': 'AWS Cloud9',
+    'config': 'AWS Config',
+    'guardduty': 'Amazon GuardDuty',
+    'inspector': 'Amazon Inspector',
+    'macie': 'Amazon Macie',
+    'securityhub': 'AWS Security Hub',
+    'trusted-advisor': 'AWS Support',
+    'support': 'AWS Support',
+    'workmail': 'AmazonWorkMail',
+    'ses': 'Amazon Simple Email Service',
+    'pinpoint': 'Amazon Pinpoint',
+    'connect': 'Amazon Connect',
+    'chime': 'Amazon Chime',
+    'workspaces': 'Amazon WorkSpaces',
+    'appstream': 'Amazon AppStream',
+    'workdocs': 'Amazon WorkDocs',
+    'worklink': 'Amazon WorkLink',
+    'iot': 'AWS IoT',
+    'iot-core': 'AWS IoT Core',
+    'greengrass': 'AWS IoT Greengrass',
+    'device-farm': 'AWS Device Farm',
+    'xray': 'AWS X-Ray',
+    'application-insights': 'Amazon CloudWatch Application Insights',
+    'cost-explorer': 'AWS Cost Explorer',
+    'budgets': 'AWS Budgets',
+    'billing': 'AWS Billing',
+    'organizations': 'AWS Organizations',
+    'control-tower': 'AWS Control Tower',
+    'service-catalog': 'AWS Service Catalog',
+    'license-manager': 'AWS License Manager',
+    'well-architected': 'AWS Well-Architected Tool',
+    'personal-health-dashboard': 'AWS Personal Health Dashboard',
+    'chatbot': 'AWS Chatbot',
+    'data-exchange': 'AWS Data Exchange',
+    'marketplace': 'AWS Marketplace',
+    'ground-station': 'AWS Ground Station',
+    'robomaker': 'AWS RoboMaker',
+    'sumerian': 'Amazon Sumerian',
+    'forecast': 'Amazon Forecast',
+    'personalize': 'Amazon Personalize',
+    'textract': 'Amazon Textract',
+    'transcribe': 'Amazon Transcribe',
+    'translate': 'Amazon Translate',
+    'polly': 'Amazon Polly',
+    'rekognition': 'Amazon Rekognition',
+    'lex': 'Amazon Lex',
+    'sagemaker-ground-truth': 'Amazon SageMaker Ground Truth',
+    'quicksight': 'Amazon QuickSight',
+    'athena': 'Amazon Athena',
+    'msk': 'Amazon Managed Streaming for Apache Kafka',
+    'kafka': 'Amazon Managed Streaming for Apache Kafka',
+    'mq': 'Amazon MQ',
+    'managed-blockchain': 'Amazon Managed Blockchain',
+    'quantum-ledger-database': 'Amazon QLDB',
+    'datazone': 'Amazon DataZone',
+    'location': 'Amazon Location Service',
+    'devops-guru': 'Amazon DevOps Guru'
+}
 _SQL_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 _TAG_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+=@-]{0,127}$")
 _TAG_VALUE_SAFE_RE = re.compile(r"^[^;'\"\\]{0,256}$")
@@ -169,7 +303,7 @@ class CURQueryBuilder:
           AND line_item_line_item_type = 'Usage'
         GROUP BY {tag_expression}
         ORDER BY total_cost DESC
-        """
+        """  # nosec B608 - identifiers validated (_SQL_IDENTIFIER_RE) or from allowlists; values regex-validated and escaped
 
         logger.debug(f"Built costs-by-tag query for '{tag_key}' covering {len(partition_filters)} partitions")
         return query.strip(), []
@@ -233,7 +367,7 @@ class CURQueryBuilder:
           AND line_item_line_item_type = 'Usage'
         GROUP BY {group_expression}
         ORDER BY {group_expression}
-        """
+        """  # nosec B608 - identifiers validated (_SQL_IDENTIFIER_RE) or from allowlists; values regex-validated and escaped
         
         logger.debug(f"Built cost trends query for {tag_key}='{tag_value}' covering {months_back} months")
         return query.strip()
@@ -271,7 +405,7 @@ class CURQueryBuilder:
         GROUP BY {self.service_name_expression}
         ORDER BY total_cost DESC
         LIMIT 50
-        """
+        """  # nosec B608 - identifiers validated (_SQL_IDENTIFIER_RE) or from allowlists; values regex-validated and escaped
         
         logger.debug(f"Built service costs query covering {months_back} months")
         return query.strip()
@@ -307,7 +441,7 @@ class CURQueryBuilder:
         GROUP BY line_item_usage_account_id
         ORDER BY total_cost DESC
         LIMIT 25
-        """
+        """  # nosec B608 - identifiers validated (_SQL_IDENTIFIER_RE) or from allowlists; values regex-validated and escaped
         
         logger.debug(f"Built account costs query covering {months_back} months")
         return query.strip()
@@ -361,143 +495,18 @@ class CURQueryBuilder:
         # Build service filter (optional optimization)
         service_filter = ""
         if service_type and service_type != 'unknown':
-            service_name_patterns = {
-                'ec2': 'Amazon Elastic Compute Cloud',
-                's3': 'Amazon Simple Storage Service', 
-                'rds': 'Amazon Relational Database Service',
-                'lambda': 'AWS Lambda',
-                'ecs': 'Amazon EC2 Container Service',
-                'elb': 'Elastic Load Balancing',
-                'elasticache': 'Amazon ElastiCache',
-                'dynamodb': 'Amazon DynamoDB',
-                'sqs': 'Amazon Simple Queue Service',
-                'sns': 'Amazon Simple Notification Service',
-                'kms': 'AWS Key Management Service',
-                'secretsmanager': 'AWS Secrets Manager',
-                'secrets-manager': 'AWS Secrets Manager',
-                'acm': 'AWS Certificate Manager',
-                'certificate-manager': 'AWS Certificate Manager',
-                'cognito': 'Amazon Cognito',
-                'sagemaker': 'Amazon SageMaker',
-                'glue': 'AWS Glue',
-                'comprehend': 'Amazon Comprehend',
-                'bedrock': 'Amazon Bedrock Service',
-                'kendra': 'Amazon Kendra',
-                'elasticsearch': 'Amazon Elasticsearch Service',
-                'es': 'Amazon Elasticsearch Service',
-                'opensearch': 'Amazon OpenSearch Service',
-                'cloudformation': 'AWS CloudFormation',
-                'cloudtrail': 'AWS CloudTrail',
-                'logs': 'AmazonCloudWatch',
-                'cloudwatch-logs': 'AmazonCloudWatch',
-                'cloudwatch': 'AmazonCloudWatch',
-                'systems-manager': 'AWS Systems Manager',
-                'ssm': 'AWS Systems Manager',
-                'batch': 'AWS Batch',
-                'efs': 'Amazon Elastic File System',
-                'fsx': 'Amazon FSx',
-                'redshift': 'Amazon Redshift',
-                'documentdb': 'Amazon DocumentDB',
-                'docdb': 'Amazon DocumentDB',
-                'neptune': 'Amazon Neptune',
-                'qldb': 'Amazon QLDB',
-                'timestream': 'Amazon Timestream',
-                'cloudfront': 'Amazon CloudFront',
-                'route53': 'Amazon Route 53',
-                'nat-gateway': 'Amazon Virtual Private Cloud',
-                'natgw': 'Amazon Virtual Private Cloud',
-                'vpc-endpoint': 'Amazon Virtual Private Cloud',
-                'vpce': 'Amazon Virtual Private Cloud',
-                'elastic-ip': 'Amazon Virtual Private Cloud',
-                'eip': 'Amazon Virtual Private Cloud',
-                'transit-gateway': 'AWS Transit Gateway',
-                'tgw': 'AWS Transit Gateway',
-                'direct-connect': 'AWS Direct Connect',
-                'dx': 'AWS Direct Connect',
-                'vpn': 'Amazon Virtual Private Cloud',
-                'globalaccelerator': 'AWS Global Accelerator',
-                'waf': 'AWS WAF',
-                'emr': 'Amazon Elastic MapReduce',
-                'kinesis': 'Amazon Kinesis',
-                'kinesis-data-streams': 'Amazon Kinesis',
-                'kinesis-firehose': 'Amazon Kinesis Firehose',
-                'firehose': 'Amazon Kinesis Firehose',
-                'kinesis-analytics': 'Amazon Kinesis Analytics',
-                'kinesisanalytics': 'Amazon Kinesis Analytics',
-                'apigateway': 'Amazon API Gateway',
-                'api-gateway': 'Amazon API Gateway',
-                'appsync': 'AWS AppSync',
-                'stepfunctions': 'AWS Step Functions',
-                'step-functions': 'AWS Step Functions',
-                'codebuild': 'AWS CodeBuild',
-                'codedeploy': 'AWS CodeDeploy',
-                'codepipeline': 'AWS CodePipeline',
-                'codecommit': 'AWS CodeCommit',
-                'cloud9': 'AWS Cloud9',
-                'config': 'AWS Config',
-                'guardduty': 'Amazon GuardDuty',
-                'inspector': 'Amazon Inspector',
-                'macie': 'Amazon Macie',
-                'securityhub': 'AWS Security Hub',
-                'trusted-advisor': 'AWS Support',
-                'support': 'AWS Support',
-                'workmail': 'AmazonWorkMail',
-                'ses': 'Amazon Simple Email Service',
-                'pinpoint': 'Amazon Pinpoint',
-                'connect': 'Amazon Connect',
-                'chime': 'Amazon Chime',
-                'workspaces': 'Amazon WorkSpaces',
-                'appstream': 'Amazon AppStream',
-                'workdocs': 'Amazon WorkDocs',
-                'worklink': 'Amazon WorkLink',
-                'iot': 'AWS IoT',
-                'iot-core': 'AWS IoT Core',
-                'greengrass': 'AWS IoT Greengrass',
-                'device-farm': 'AWS Device Farm',
-                'xray': 'AWS X-Ray',
-                'application-insights': 'Amazon CloudWatch Application Insights',
-                'cost-explorer': 'AWS Cost Explorer',
-                'budgets': 'AWS Budgets',
-                'billing': 'AWS Billing',
-                'organizations': 'AWS Organizations',
-                'control-tower': 'AWS Control Tower',
-                'service-catalog': 'AWS Service Catalog',
-                'license-manager': 'AWS License Manager',
-                'well-architected': 'AWS Well-Architected Tool',
-                'personal-health-dashboard': 'AWS Personal Health Dashboard',
-                'chatbot': 'AWS Chatbot',
-                'data-exchange': 'AWS Data Exchange',
-                'marketplace': 'AWS Marketplace',
-                'ground-station': 'AWS Ground Station',
-                'robomaker': 'AWS RoboMaker',
-                'sumerian': 'Amazon Sumerian',
-                'forecast': 'Amazon Forecast',
-                'personalize': 'Amazon Personalize',
-                'textract': 'Amazon Textract',
-                'transcribe': 'Amazon Transcribe',
-                'translate': 'Amazon Translate',
-                'polly': 'Amazon Polly',
-                'rekognition': 'Amazon Rekognition',
-                'lex': 'Amazon Lex',
-                'sagemaker-ground-truth': 'Amazon SageMaker Ground Truth',
-                'quicksight': 'Amazon QuickSight',
-                'athena': 'Amazon Athena',
-                'msk': 'Amazon Managed Streaming for Apache Kafka',
-                'kafka': 'Amazon Managed Streaming for Apache Kafka',
-                'mq': 'Amazon MQ',
-                'managed-blockchain': 'Amazon Managed Blockchain',
-                'quantum-ledger-database': 'Amazon QLDB',
-                'datazone': 'Amazon DataZone',
-                'location': 'Amazon Location Service',
-                'devops-guru': 'Amazon DevOps Guru'
-            }
             
             if not _SERVICE_TYPE_RE.fullmatch(service_type):
                 raise ValueError(f"Invalid service_type: {service_type!r}")
-            service_pattern = service_name_patterns.get(service_type, service_type)
+            service_pattern = SERVICE_NAME_PATTERNS.get(service_type, service_type)
+            # Full ARNs are globally unique, so the service guard applies only
+            # to bare IDs (which can collide across services, e.g. 'default').
+            # Guarding ARNs too dropped real cost: EKS ("Amazon Elastic Container
+            # Service for Kubernetes" never matches '%eks%') and EC2 public IPv4,
+            # which bills under Amazon VPC.
             service_filter = (
-                f"AND {self.service_name_expression} "
-                f"LIKE '%{service_pattern}%'"
+                f"AND (line_item_resource_id LIKE 'arn:%' OR "
+                f"{self.service_name_expression} LIKE '%{service_pattern}%')"
             )
         
         query = f"""
@@ -516,7 +525,7 @@ class CURQueryBuilder:
           {service_filter}
         GROUP BY line_item_resource_id, {self.service_name_expression}
         ORDER BY monthly_cost DESC
-        """
+        """  # nosec B608 - table validated (_SQL_IDENTIFIER_RE); resource IDs validated (_RESOURCE_ID_RE/_ARN_RE) and escaped
         
         logger.debug(
             f"Built direct ARN costs query for {len(safe_resource_ids)} "
@@ -612,7 +621,7 @@ class CURQueryBuilder:
         FROM {self.full_table_name}
         WHERE ({' OR '.join(partition_filters)})
         LIMIT 1
-        """.strip()
+        """.strip()  # nosec B608 - identifiers validated (_SQL_IDENTIFIER_RE) or from allowlists; values regex-validated and escaped
 
     def build_available_tag_keys_query(
         self,
@@ -642,7 +651,7 @@ class CURQueryBuilder:
           AND tag_key != ''
         ORDER BY tag_key
         LIMIT {limit}
-        """.strip()
+        """.strip()  # nosec B608 - identifiers validated (_SQL_IDENTIFIER_RE) or from allowlists; values regex-validated and escaped
     
     def estimate_query_cost(self, query: str, data_scanned_gb: Optional[float] = None) -> Dict:
         """
@@ -823,7 +832,7 @@ class CURQueryBuilder:
                       AND line_item_line_item_type = 'Usage'
                     GROUP BY billing_period
                     ORDER BY billing_period
-                    """.strip()
+                    """.strip()  # nosec B608 - identifiers validated (_SQL_IDENTIFIER_RE) or from allowlists; values regex-validated and escaped
 
                 if not _BILLING_PERIOD_RE.fullmatch(str(billing_period)):
                     raise ValueError("invalid billing_period")
@@ -843,7 +852,7 @@ class CURQueryBuilder:
                     GROUP BY line_item_resource_id, {self.service_name_expression}
                     ORDER BY total_cost DESC
                     LIMIT {limit}
-                    """.strip()
+                    """.strip()  # nosec B608 - identifiers validated (_SQL_IDENTIFIER_RE) or from allowlists; values regex-validated and escaped
                 if template_name == 'service_summary':
                     return f"""
                     SELECT {self.service_name_expression} as service,
@@ -855,7 +864,7 @@ class CURQueryBuilder:
                       AND line_item_line_item_type = 'Usage'
                     GROUP BY {self.service_name_expression}
                     ORDER BY total_cost DESC
-                    """.strip()
+                    """.strip()  # nosec B608 - identifiers validated (_SQL_IDENTIFIER_RE) or from allowlists; values regex-validated and escaped
             else:
                 if template_name == 'monthly_costs':
                     start_year = str(kwargs['start_year'])
@@ -871,7 +880,7 @@ class CURQueryBuilder:
                       AND line_item_line_item_type = 'Usage'
                     GROUP BY year, month
                     ORDER BY year, month
-                    """.strip()
+                    """.strip()  # nosec B608 - identifiers validated (_SQL_IDENTIFIER_RE) or from allowlists; values regex-validated and escaped
 
                 year = str(kwargs.get('year'))
                 month = str(kwargs.get('month'))
@@ -895,7 +904,7 @@ class CURQueryBuilder:
                     GROUP BY line_item_resource_id, {self.service_name_expression}
                     ORDER BY total_cost DESC
                     LIMIT {limit}
-                    """.strip()
+                    """.strip()  # nosec B608 - identifiers validated (_SQL_IDENTIFIER_RE) or from allowlists; values regex-validated and escaped
                 if template_name == 'service_summary':
                     return f"""
                     SELECT {self.service_name_expression} as service,
@@ -907,7 +916,7 @@ class CURQueryBuilder:
                       AND line_item_line_item_type = 'Usage'
                     GROUP BY {self.service_name_expression}
                     ORDER BY total_cost DESC
-                    """.strip()
+                    """.strip()  # nosec B608 - identifiers validated (_SQL_IDENTIFIER_RE) or from allowlists; values regex-validated and escaped
         except (KeyError, TypeError, ValueError) as exc:
             logger.error(
                 f"Invalid parameter for template '{template_name}': {exc}"

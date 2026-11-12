@@ -27,6 +27,13 @@ Parameters:
     Type: String
     Description: S3 bucket name containing pre-built Lambda deployment packages (e.g., my-taginsights-bucket)
 
+  AccessLogsBucketName:
+    Type: String
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+    Description: >
+      REQUIRED. Existing S3 server access log bucket (same account and Region, SSE-S3,
+      bucket policy allowing logging.s3.amazonaws.com), usually from your logging baseline.
+
   OrganizationId:
     Type: String
     Default: ""
@@ -34,7 +41,7 @@ Parameters:
     ConstraintDescription: "Must be a valid organization ID starting with 'o-' or empty"
     Description: >
       AWS Organization ID (e.g., o-abc123xyz). Required for multi-account deployments.
-      Grants member accounts permission to forward events to the hub and replicate tag data.
+      Grants member accounts permission to forward tag events to the hub event bus.
 
   HubRegion:
     Type: String
@@ -181,6 +188,7 @@ Resources:
         ProjectName: ti
         Environment: !Ref Environment
         OrganizationId: !Ref OrganizationId
+        AccessLogsBucketName: !Ref AccessLogsBucketName
         ForceDeleteOnStackRemoval: !Ref ForceDeleteOnStackRemoval
       Tags:
         - Key: Application
@@ -223,6 +231,7 @@ Resources:
   # ============================================================================
   # 3. COST ANALYSIS (optional)
   # ============================================================================
+  # Cost analysis is the only optional stack; it depends only on CoreStack outputs.
   # ============================================================================
 
   CostAnalysisStack:

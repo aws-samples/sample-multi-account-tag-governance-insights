@@ -32,18 +32,18 @@ except ImportError:
 
 try:
     # Try relative imports first (normal package structure)
-    from .query_builder import CURQueryBuilder
+    from .query_builder import CURQueryBuilder, SERVICE_NAME_PATTERNS
     from .schema_manager import CURSchemaManager
     from .cur_provider import CURCostProvider
 except ImportError:
     try:
         # Try absolute imports from src.cost (Lambda environment)
-        from src.lambda_handlers.cost.query_builder import CURQueryBuilder
+        from src.lambda_handlers.cost.query_builder import CURQueryBuilder, SERVICE_NAME_PATTERNS
         from src.lambda_handlers.cost.schema_manager import CURSchemaManager
         from src.lambda_handlers.cost.cur_provider import CURCostProvider
     except ImportError:
         # Final fallback for direct imports (development)
-        from query_builder import CURQueryBuilder
+        from query_builder import CURQueryBuilder, SERVICE_NAME_PATTERNS
         from schema_manager import CURSchemaManager
         from cur_provider import CURCostProvider
 
@@ -139,214 +139,91 @@ class CURDirectMatcher:
         logger.info(f"Getting costs for {len(resources)} resources using direct ARN matching")
         
         try:
-            # Group resources by service type for efficient querying
-            resources_by_service = self._group_resources_by_service(resources)
-            
             all_cost_results = []
-            
-            # Process each service type separately for optimization
-            for service_type, service_resources in resources_by_service.items():
-                logger.debug(f"Processing {len(service_resources)} {service_type} resources")
-                
-                service_costs = self._get_costs_for_service_resources(
-                    service_resources, service_type, months_back
-                )
-                all_cost_results.extend(service_costs)
-            
+            for batch in self._batch_resources(resources, self.batch_size):
+                all_cost_results.extend(self._process_mixed_batch(batch, months_back))
             logger.info(f"Cost analysis completed for {len(all_cost_results)} resources")
             return all_cost_results
-            
         except Exception as e:
             logger.error(f"Error in direct ARN cost matching: {e}")
             return self._create_empty_cost_results(resources)
-    
-    def _get_costs_for_service_resources(self, resources: List[Dict], 
-                                       service_type: str, months_back: int) -> List[Dict]:
+
+    def _process_mixed_batch(self, resources: List[Dict], months_back: int) -> List[Dict]:
         """
-        Get costs for resources of a specific service type
-        
-        Args:
-            resources: List of resources for this service
-            service_type: AWS service type (e.g., 'ec2', 's3')
-            months_back: Number of months to analyze
-            
-        Returns:
-            List[Dict]: Resources with cost data
+        Price a batch of resources of any mix of services with ONE CUR query.
+
+        The query matches exact IDs, so splitting it by service bought nothing
+        (CUR is partitioned only by month; each query scans the month anyway)
+        and cost ~2.3 s of start/poll overhead per service per batch.
+
+        Each resource is searched under every ID form CUR may use: S3 bucket
+        name + ARN, otherwise the per-service normalized ID + the full ARN.
+        Bare IDs can collide across services (e.g. 'default'), so a bare-ID row
+        only counts if its product name matches that resource's service.
         """
-        service_results = []
-        
         try:
-            # Process resources in batches to avoid query complexity limits
-            for batch in self._batch_resources(resources, self.batch_size):
-                batch_results = self._process_resource_batch(batch, service_type, months_back)
-                service_results.extend(batch_results)
-            
-            return service_results
-            
-        except Exception as e:
-            logger.error(f"Error processing {service_type} resources: {e}")
-            # Return resources with zero costs rather than failing completely
-            return self._create_empty_cost_results(resources)
-    
-    def _process_resource_batch(self, resources: List[Dict], 
-                              service_type: str, months_back: int) -> List[Dict]:
-        """
-        Process a batch of resources for cost matching
-        
-        Args:
-            resources: Batch of resources to process
-            service_type: AWS service type
-            months_back: Number of months to analyze
-            
-        Returns:
-            List[Dict]: Resources with cost data
-        """
-        batch_results = []
-        
-        try:
-            # Special handling for S3 - generate both formats for historical compatibility
-            if service_type == 's3':
-                return self._process_s3_resource_batch(resources, months_back)
-            
-            # Standard processing for non-S3 resources
-            normalized_mapping = {}  # original_arn -> normalized_arn
+            plan = []                 # (resource, service_type, candidate_ids)
+            bare_id_patterns = {}     # bare id -> {service name substrings}
             for resource in resources:
-                original_arn = resource['resource_arn']
-                normalized_arn = self._normalize_arn_for_cur(original_arn, service_type)
-                normalized_mapping[original_arn] = normalized_arn
-            
-            # Get unique normalized ARNs (avoid duplicates)
-            unique_normalized_arns = list(set(normalized_mapping.values()))
-            
-            if not unique_normalized_arns:
-                logger.warning(f"No valid normalized ARNs for {service_type} batch")
+                arn = resource['resource_arn']
+                service_type = (resource.get('service_type') or resource.get('resource_type') or 'unknown')
+                if service_type == 's3':
+                    ids = self._get_s3_search_formats(arn)
+                else:
+                    ids = [i for i in dict.fromkeys((self._normalize_arn_for_cur(arn, service_type), arn)) if i]
+                plan.append((resource, service_type, ids))
+                for i in ids:
+                    if not i.startswith('arn:') and service_type != 'unknown':
+                        bare_id_patterns.setdefault(i, set()).add(
+                            SERVICE_NAME_PATTERNS.get(service_type, service_type))
+
+            unique_ids = sorted({i for _, _, ids in plan for i in ids})
+            if not unique_ids:
                 return self._create_empty_cost_results(resources)
-            
-            # Query CUR for these specific ARNs
-            cur_costs = self._query_cur_for_arns(unique_normalized_arns, service_type, months_back)
-            
-            # Map results back to original resources
-            for resource in resources:
-                original_arn = resource['resource_arn']
-                normalized_arn = normalized_mapping[original_arn]
-                
-                # Find cost data for this ARN
-                cost_data = cur_costs.get(normalized_arn, {})
-                
-                # Merge resource info with cost data
+            cur_costs = self._query_cur_for_arns(unique_ids, 'unknown', months_back, bare_id_patterns)
+
+            results = []
+            for resource, service_type, ids in plan:
+                matched = [i for i in ids if i in cur_costs]
+                cost_data = self._combine_cost_data([cur_costs[i] for i in matched])
                 result = {
-                    **resource,  # Original resource metadata
+                    **resource,
                     'monthly_cost': cost_data.get('monthly_cost', 0.0),
                     'usage_records': cost_data.get('usage_records', 0),
                     'avg_daily_cost': cost_data.get('avg_daily_cost', 0.0),
                     'first_usage': cost_data.get('first_usage', ''),
                     'last_usage': cost_data.get('last_usage', ''),
                     'matched_in_cur': cost_data.get('matched_in_cur', False),
-                    'normalized_arn': normalized_arn
+                    'normalized_arn': (matched[0] if len(matched) == 1
+                                       else f"combined({len(matched)})" if matched
+                                       else (ids[0] if ids else '')),
                 }
-                
-                batch_results.append(result)
-            
-            return batch_results
-            
+                if service_type == 's3':
+                    result['s3_search_formats'] = ids
+                results.append(result)
+            return results
         except Exception as e:
             logger.error(f"Error processing resource batch: {e}")
             return self._create_empty_cost_results(resources)
-    
-    def _process_s3_resource_batch(self, resources: List[Dict], months_back: int) -> List[Dict]:
-        """
-        Special processing for S3 resources - queries both ARN and bucket name formats
-        for comprehensive historical data capture
-        
-        Args:
-            resources: S3 resources to process
-            months_back: Number of months to analyze
-            
-        Returns:
-            List[Dict]: Resources with cost data from both formats
-        """
-        batch_results = []
-        
-        try:
-            # Generate both formats for each S3 resource
-            all_search_formats = set()
-            resource_format_mapping = {}  # original_arn -> [format1, format2, ...]
-            
-            for resource in resources:
-                original_arn = resource['resource_arn']
-                formats = self._get_s3_search_formats(original_arn)
-                resource_format_mapping[original_arn] = formats
-                all_search_formats.update(formats)
-            
-            if not all_search_formats:
-                logger.warning("No valid S3 search formats generated")
-                return self._create_empty_cost_results(resources)
-            
-            # Query CUR for all S3 formats
-            logger.debug(f"Querying CUR for {len(all_search_formats)} S3 format variations")
-            cur_costs = self._query_cur_for_arns(list(all_search_formats), 's3', months_back)
-            
-            # Map results back to original resources (check all possible formats)
-            for resource in resources:
-                original_arn = resource['resource_arn']
-                search_formats = resource_format_mapping[original_arn]
-                
-                # Try to find cost data in any of the formats
-                cost_data = {}
-                matched_format = None
-                
-                for format_variant in search_formats:
-                    if format_variant in cur_costs:
-                        cost_data = cur_costs[format_variant]
-                        matched_format = format_variant
-                        break
-                
-                # If no direct match, combine data from multiple formats (edge case)
-                if not cost_data and len(search_formats) > 1:
-                    combined_cost = 0.0
-                    combined_usage = 0
-                    matched_formats = []
-                    
-                    for format_variant in search_formats:
-                        if format_variant in cur_costs:
-                            format_cost_data = cur_costs[format_variant]
-                            combined_cost += format_cost_data.get('monthly_cost', 0.0)
-                            combined_usage += format_cost_data.get('usage_records', 0)
-                            matched_formats.append(format_variant)
-                    
-                    if matched_formats:
-                        cost_data = {
-                            'monthly_cost': combined_cost,
-                            'usage_records': combined_usage,
-                            'avg_daily_cost': combined_cost / 30 if combined_cost > 0 else 0,
-                            'first_usage': '',  # Would need aggregation logic
-                            'last_usage': '',   # Would need aggregation logic  
-                            'matched_in_cur': True
-                        }
-                        matched_format = f"combined({len(matched_formats)})"
-                
-                # Merge resource info with cost data
-                result = {
-                    **resource,  # Original resource metadata
-                    'monthly_cost': cost_data.get('monthly_cost', 0.0),
-                    'usage_records': cost_data.get('usage_records', 0),
-                    'avg_daily_cost': cost_data.get('avg_daily_cost', 0.0),
-                    'first_usage': cost_data.get('first_usage', ''),
-                    'last_usage': cost_data.get('last_usage', ''),
-                    'matched_in_cur': cost_data.get('matched_in_cur', False),
-                    'normalized_arn': matched_format or search_formats[0] if search_formats else '',
-                    's3_search_formats': search_formats  # Debug info
-                }
-                
-                batch_results.append(result)
-            
-            logger.debug(f"S3 batch processing completed: {len(batch_results)} resources processed")
-            return batch_results
-            
-        except Exception as e:
-            logger.error(f"Error processing S3 resource batch: {e}")
-            return self._create_empty_cost_results(resources)
-    
+
+    @staticmethod
+    def _combine_cost_data(matches: List[Dict]) -> Dict:
+        """Sum CUR matches found under different ID forms of one resource."""
+        if not matches:
+            return {}
+        if len(matches) == 1:
+            return matches[0]
+        firsts = [m['first_usage'] for m in matches if m.get('first_usage')]
+        lasts = [m['last_usage'] for m in matches if m.get('last_usage')]
+        return {
+            'monthly_cost': sum(m.get('monthly_cost', 0.0) for m in matches),
+            'usage_records': sum(m.get('usage_records', 0) for m in matches),
+            'avg_daily_cost': sum(m.get('avg_daily_cost', 0.0) for m in matches),
+            'first_usage': min(firsts) if firsts else '',
+            'last_usage': max(lasts) if lasts else '',
+            'matched_in_cur': True,
+        }
+
     def _get_s3_search_formats(self, arn: str) -> List[str]:
         """
         Generate all possible S3 formats to search for in CUR data
@@ -396,7 +273,8 @@ class CURDirectMatcher:
             return [arn]  # Fallback to original ARN
     
     def _query_cur_for_arns(self, normalized_arns: List[str],
-                          service_type: str, months_back: int) -> Dict[str, Dict]:
+                          service_type: str, months_back: int,
+                          bare_id_patterns: Optional[Dict[str, set]] = None) -> Dict[str, Dict]:
         """
         Query CUR for specific normalized ARNs
         
@@ -427,19 +305,25 @@ class CURDirectMatcher:
                 logger.warning(f"CUR query failed for {service_type}: {query_result.get('error', 'Unknown error')}")
                 return {}
             
-            # Process query results into ARN -> cost mapping
-            arn_costs = {}
+            # Process query results into ARN -> cost mapping. The query groups by
+            # resource AND service name, so one resource can return several rows
+            # (e.g. RDS + a $0 "AWS Data Transfer" row); sum them, never overwrite.
+            rows_by_arn = {}
             for row in query_result.get('data', []):
                 arn = row.get('resource_id', '')
+                patterns = (bare_id_patterns or {}).get(arn)
+                if patterns and not any(p in (row.get('service_name') or '') for p in patterns):
+                    continue  # bare ID belongs to a different service
                 if arn:
-                    arn_costs[arn] = {
+                    rows_by_arn.setdefault(arn, []).append({
                         'monthly_cost': float(row.get('monthly_cost', 0)),
                         'usage_records': int(row.get('usage_records', 0)),
                         'avg_daily_cost': float(row.get('avg_daily_cost', 0)),
                         'first_usage': row.get('first_usage', ''),
                         'last_usage': row.get('last_usage', ''),
                         'matched_in_cur': True
-                    }
+                    })
+            arn_costs = {arn: self._combine_cost_data(rows) for arn, rows in rows_by_arn.items()}
             
             logger.debug(f"Retrieved costs for {len(arn_costs)} out of {len(normalized_arns)} ARNs")
             

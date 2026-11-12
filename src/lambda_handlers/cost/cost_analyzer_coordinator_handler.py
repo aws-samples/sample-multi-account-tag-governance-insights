@@ -166,7 +166,7 @@ class CostAnalyzerCoordinator:
         FROM {db_name}.{table_name}
         {where_clause}
         ORDER BY timestamp DESC
-        """
+        """  # nosec B608 - identifiers from operator config; where_clause is a fixed string
         
         try:
             # Execute query with exponential backoff for throttling
@@ -231,10 +231,11 @@ class CostAnalyzerCoordinator:
                 # Generate deduplication ID based on batch content
                 deduplication_id = self._generate_dedup_id(batch)
                 
-                # Generate message group ID (use account_id for ordering within account)
-                # This ensures resources from same account are processed in order
+                # One message group per batch: batches are independent (each
+                # writes its own daily file, compacted later), so a per-account
+                # group only serialized them and left ESM concurrency unused.
                 account_id = batch[0].get('account_id', 'default') if batch else 'default'
-                message_group_id = f"account-{account_id}"
+                message_group_id = f"account-{account_id}-batch-{batch_idx}"
                 
                 # Send to SQS FIFO queue
                 response = self.sqs.send_message(

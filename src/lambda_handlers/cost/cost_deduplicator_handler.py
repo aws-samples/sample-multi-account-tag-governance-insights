@@ -170,9 +170,9 @@ class CostDeduplicator:
                 MAX(analysis_date) as analysis_date, MAX(last_updated) as last_updated
             FROM {temp_daily_table_select}
             GROUP BY tag_key, tag_value, resource_arn, resource_type, region
-            """)
+            """)  # nosec B608 - names from database config + account_id matched to \d{12} + int year/month
 
-            count_results = self.athena.execute_query(f'SELECT COUNT(*) as row_count FROM {temp_dedup_table_ctas}')
+            count_results = self.athena.execute_query(f'SELECT COUNT(*) as row_count FROM {temp_dedup_table_ctas}')  # nosec B608 - names from database config + account_id matched to \d{12} + int year/month
             row_count = int(count_results[0].get('row_count', 0)) if count_results else 0
 
             get_table_response = self.glue.get_table(DatabaseName=self.database_name, Name=temp_dedup_table_name)

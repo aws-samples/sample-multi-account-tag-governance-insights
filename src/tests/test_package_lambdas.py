@@ -57,6 +57,7 @@ def test_worker_only_selection_does_not_build_other_functions(tmp_path):
 def test_function_registry_lists_all_lambda_functions():
     functions = LambdaPackager._lambda_functions()
 
+    assert "include_dirs" not in functions["analytics_writer"]
     assert set(functions) == {
         "aggregator_coordinator",
         "aggregator_worker",
@@ -65,6 +66,8 @@ def test_function_registry_lists_all_lambda_functions():
         "cost_analyzer_coordinator",
         "cost_analyzer_worker",
         "cost_deduplicator",
+        "tag_compliance_rule",
+        "tag_compliance_report",
     }
 
 
@@ -364,3 +367,12 @@ def test_production_signing_uses_versioned_source_and_destination(
     }
     s3.copy_object.assert_not_called()
     s3.delete_object.assert_not_called()
+
+
+def test_run_argv_refuses_shell_and_strings():
+    import pytest
+    from deployment.package_lambdas import run_argv
+    with pytest.raises(ValueError):
+        run_argv("pip install x")
+    with pytest.raises(ValueError):
+        run_argv(["pip", "install", "x"], **{"shell": True})  # must be refused

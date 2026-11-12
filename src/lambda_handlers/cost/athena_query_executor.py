@@ -361,7 +361,7 @@ if __name__ == "__main__":
         executor = AthenaQueryExecutor(database, output_bucket)
         
         # Simple test query
-        test_query = f"SELECT COUNT(*) as count FROM {database}.resource_tag_deltas_recent LIMIT 1"
+        test_query = f"SELECT COUNT(*) as count FROM {database}.resource_tag_deltas_recent LIMIT 1"  # nosec B608 - local __main__ smoke test; database name from operator env var
         
         print(f"Executing test query: {test_query}")
         results = executor.execute_query(test_query)

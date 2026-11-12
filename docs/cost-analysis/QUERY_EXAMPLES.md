@@ -178,6 +178,81 @@ LIMIT 50;
 
 **Use case:** Multi-dimensional cost analysis for complex organizational structures.
 
+### Multi-Value Tag Cost Split (Shared Resources)
+
+A shared resource tagged `CustomerName = ACME+GLOBEX` is one CUR line item. CUR,
+Cost Categories split charges, and split cost allocation data can't divide one
+resource's cost by the entries of a multi-value tag; this query splits it evenly.
+Use `+` (or `:`) as the delimiter: S3 rejects commas in tag values.
+
+```sql
+-- Even split of each resource's cost across the customers in a multi-value tag.
+-- Entries are trimmed, de-duplicated, and empty entries (e.g. a trailing '+')
+-- dropped BEFORE dividing, so the allocated total always equals the input cost.
+WITH latest AS (
+    SELECT * FROM "ti_REGION_ENV_ACCOUNT".tag_costs
+    WHERE year = YEAR(CURRENT_DATE) AND month = MONTH(CURRENT_DATE)
+      AND analysis_date = (
+          SELECT MAX(analysis_date) FROM "ti_REGION_ENV_ACCOUNT".tag_costs
+          WHERE year = YEAR(CURRENT_DATE) AND month = MONTH(CURRENT_DATE))
+),
+shared AS (
+    SELECT resource_arn, current_month_mtd,
+           array_distinct(filter(transform(split(tag_value, '+'), x -> trim(x)), x -> x <> '')) AS customers
+    FROM latest
+    WHERE tag_key = 'CustomerName'
+)
+SELECT
+    customer,
+    COUNT(DISTINCT resource_arn) AS shared_resources,
+    ROUND(SUM(current_month_mtd / CARDINALITY(customers)), 2) AS allocated_cost
+FROM shared
+CROSS JOIN UNNEST(customers) AS t(customer)
+WHERE CARDINALITY(customers) > 0
+GROUP BY customer
+ORDER BY allocated_cost DESC;
+```
+
+**Use case:** Charge back shared infrastructure to each customer listed on it.
+For weighted splits, join a `customer_weights` table instead of dividing by
+`CARDINALITY`.
+
+### Current Tag State (One Row per Resource)
+
+The delta tables hold change events, not resources: a resource with three
+tag changes has three rows, and a `resource_removed` row can follow earlier
+rows. Count resources from the latest row per ARN, across both the daily
+(last 90 days) and monthly-compacted tables. This query does not need Cost
+Analysis.
+
+```sql
+-- Required-tag coverage by account from current state
+WITH all_deltas AS (
+    SELECT account_id, arn, tags, change_type, timestamp
+    FROM "ti_REGION_ENV_ACCOUNT".resource_tag_deltas_recent
+    UNION ALL
+    SELECT account_id, arn, tags, change_type, last_seen_timestamp AS timestamp
+    FROM "ti_REGION_ENV_ACCOUNT".resource_tag_deltas_historical
+),
+current_state AS (
+    SELECT account_id, arn, tags, change_type,
+           ROW_NUMBER() OVER (PARTITION BY arn ORDER BY timestamp DESC) AS rn
+    FROM all_deltas
+)
+SELECT
+    account_id,
+    COUNT(*) AS total_resources,
+    COUNT_IF(element_at(tags, 'Environment') IS NOT NULL) AS tagged_count,
+    ROUND(100.0 * COUNT_IF(element_at(tags, 'Environment') IS NOT NULL) / COUNT(*), 1) AS coverage_pct
+FROM current_state
+WHERE rn = 1 AND change_type <> 'resource_removed'
+GROUP BY account_id
+ORDER BY coverage_pct ASC;
+```
+
+**Use case:** Org-wide tag coverage, and the impact of enforcing a key before
+you enforce it (swap `'Environment'` for that key).
+
 ## Missing-Tag Cost Analysis
 
 ### High-Cost Resources Missing Required Tags

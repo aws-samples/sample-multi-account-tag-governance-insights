@@ -170,7 +170,7 @@ def discover_accounts_via_athena(year: int, month: int) -> List[str]:
         SELECT DISTINCT account_id
         FROM resource_tag_deltas_recent
         WHERE year = {year} AND month = {month}
-        """
+        """  # nosec B608 - account_id matched to \d{12}; year/month are ints
 
         results = execute_athena_query(query)
         accounts = []
@@ -229,7 +229,7 @@ def aggregate_account_month(account_id: str, year: int, month: int) -> int:
         GROUP BY 
             arn, resource_type, tags, previous_tags,
             change_type, source_system, region
-        """
+        """  # nosec B608 - account_id matched to \d{12}; year/month are ints
         
         # Execute query
         results = execute_athena_query(query)

@@ -647,3 +647,12 @@ def test_cur2_cost_estimation_recognizes_billing_period_pruning():
         recommendation.startswith("Add year/month")
         for recommendation in builder._get_cost_optimization_recommendations(query)
     )
+
+
+def test_service_guard_skips_full_arns():
+    """Full ARNs bypass the service-name guard; bare IDs keep it."""
+    from lambda_handlers.cost.query_builder import CURQueryBuilder
+    q = CURQueryBuilder("db", "cur").build_direct_arn_costs_query(
+        ["arn:aws:eks:us-east-1:123456789012:cluster/c1", "i-0abc"], "eks", 1
+    )
+    assert "line_item_resource_id LIKE 'arn:%' OR product_servicename LIKE '%eks%'" in q

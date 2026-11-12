@@ -829,6 +829,7 @@ def write_deltas_to_central_s3_with_dedup(deltas: List[Dict], message: Dict) -> 
 def write_parquet_with_hash(deltas: List[Dict], partition_path: str, content_hash: str):
     """Write deltas as Parquet file with content-based filename"""
     try:
+        # Delta schema (matches the resource_tag_deltas_recent Glue table)
         schema = pa.schema([
             ('arn', pa.string()),
             ('resource_type', pa.string()),
@@ -895,6 +896,7 @@ def write_json_with_hash(deltas: List[Dict], partition_path: str, content_hash: 
     except Exception as e:
         logger.error(f"Error writing JSON: {str(e)}")
         raise
+
 
 
 def emit_metric(metric_name: str, value: float, unit: str = 'Count'):

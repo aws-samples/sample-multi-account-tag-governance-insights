@@ -16,10 +16,19 @@ Parameters:
     Default: ""
     Description: >
       AWS Organization ID (e.g., o-abc123xyz). Required for multi-account deployments.
-      Grants member accounts permission to forward events to the hub event bus and
-      replicate tag deltas to the central analytics bucket.
+      Grants member accounts permission to forward tag events to the hub event bus.
     AllowedPattern: "^(o-[a-z0-9]{10,32})?$"
     ConstraintDescription: "Must be a valid organization ID starting with 'o-' or empty"
+
+  AccessLogsBucketName:
+    Type: String
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+    Description: >
+      REQUIRED. Existing S3 bucket that receives server access logs for the buckets
+      this stack creates, normally your organization's logging baseline bucket (for
+      example from AWS Control Tower or Landing Zone Accelerator). S3 requires it to be
+      in the same account and Region, without SSE-KMS default encryption, and with a
+      bucket policy granting s3:PutObject to logging.s3.amazonaws.com.
 
   ForceDeleteOnStackRemoval:
     Type: String
@@ -47,48 +56,14 @@ Resources:
   # S3 BUCKETS
   # ============================================================================
 
-  AccessLogsBucket:
-    Type: AWS::S3::Bucket
-    DeletionPolicy: !If [EnableAggressiveCleanup, Delete, Retain]
-    UpdateReplacePolicy: !If [EnableAggressiveCleanup, Delete, Retain]
-    Properties:
-      BucketName: !Sub "ti-access-logs-${AWS::Region}-${Environment}-${AWS::AccountId}"
-      LifecycleConfiguration:
-        Rules:
-          - Id: TransitionToIA
-            Status: Enabled
-            Transitions:
-              - TransitionInDays: 90
-                StorageClass: STANDARD_IA
-          - Id: DeleteOldLogs
-            Status: Enabled
-            ExpirationInDays: 365
-      PublicAccessBlockConfiguration:
-        BlockPublicAcls: true
-        BlockPublicPolicy: true
-        IgnorePublicAcls: true
-        RestrictPublicBuckets: true
-      BucketEncryption:
-        ServerSideEncryptionConfiguration:
-          - ServerSideEncryptionByDefault:
-              SSEAlgorithm: AES256
-      Tags:
-        - Key: Application
-          Value: TagInsights
-        - Key: Environment
-          Value: !Ref Environment
-        - Key: Component
-          Value: AccessLogs
-
   CentralAnalyticsBucket:
     Type: AWS::S3::Bucket
     DeletionPolicy: !If [EnableAggressiveCleanup, Delete, Retain]
     UpdateReplacePolicy: !If [EnableAggressiveCleanup, Delete, Retain]
-    DependsOn: AccessLogsBucket
     Properties:
       BucketName: !Sub "ti-central-analytics-${AWS::Region}-${Environment}-${AWS::AccountId}"
       LoggingConfiguration:
-        DestinationBucketName: !Ref AccessLogsBucket
+        DestinationBucketName: !Ref AccessLogsBucketName
         LogFilePrefix: "central-analytics/"
       VersioningConfiguration:
         Status: Enabled
@@ -128,55 +103,62 @@ Resources:
         - Key: Component
           Value: CentralAnalytics
 
+  # TLS-only on every core bucket. v4 Workers write in the hub; no account
+  # outside it may write here (the old org-wide replication grant is removed).
   CentralAnalyticsBucketPolicy:
     Type: AWS::S3::BucketPolicy
-    Condition: HasOrganization
     Properties:
       Bucket: !Ref CentralAnalyticsBucket
       PolicyDocument:
         Version: "2012-10-17"
         Statement:
-          - Sid: AllowOrgAccountsToReplicate
-            Effect: Allow
-            Principal:
-              AWS: "*"
-            Action:
-              - s3:ReplicateObject
-              - s3:ReplicateDelete
-              - s3:ReplicateTags
-              - s3:ObjectOwnerOverrideToBucketOwner
-            Resource: !Sub "${CentralAnalyticsBucket.Arn}/*"
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt CentralAnalyticsBucket.Arn
+              - !Sub "${CentralAnalyticsBucket.Arn}/*"
             Condition:
-              StringEquals:
-                "aws:PrincipalOrgID": !Ref OrganizationId
-          - Sid: AllowOrgAccountsReplicationConfig
-            Effect: Allow
-            Principal:
-              AWS: "*"
-            Action:
-              - s3:List*
-              - s3:GetBucketVersioning
-              - s3:GetReplicationConfiguration
-            Resource: !GetAtt CentralAnalyticsBucket.Arn
+              Bool:
+                "aws:SecureTransport": false
+
+  AthenaResultsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AthenaResultsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt AthenaResultsBucket.Arn
+              - !Sub "${AthenaResultsBucket.Arn}/*"
             Condition:
-              StringEquals:
-                "aws:PrincipalOrgID": !Ref OrganizationId
+              Bool:
+                "aws:SecureTransport": false
 
   AthenaResultsBucket:
     Type: AWS::S3::Bucket
     DeletionPolicy: !If [EnableAggressiveCleanup, Delete, Retain]
     UpdateReplacePolicy: !If [EnableAggressiveCleanup, Delete, Retain]
-    DependsOn: AccessLogsBucket
     Properties:
       BucketName: !Sub "ti-athena-results-${AWS::Region}-${Environment}-${AWS::AccountId}"
       LoggingConfiguration:
-        DestinationBucketName: !Ref AccessLogsBucket
+        DestinationBucketName: !Ref AccessLogsBucketName
         LogFilePrefix: "athena-results/"
+      VersioningConfiguration:
+        Status: Enabled
       LifecycleConfiguration:
         Rules:
           - Id: DeleteOldQueryResults
             Status: Enabled
             ExpirationInDays: 7
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 1
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
@@ -300,14 +282,6 @@ Resources:
     Properties:
       ServiceToken: !GetAtt BucketEmptierFunction.Arn
       BucketName: !Ref AthenaResultsBucket
-
-  AccessLogsBucketEmptier:
-    Type: Custom::BucketEmptier
-    Condition: EnableAggressiveCleanup
-    DependsOn: AccessLogsBucket
-    Properties:
-      ServiceToken: !GetAtt BucketEmptierFunction.Arn
-      BucketName: !Ref AccessLogsBucket
 
   # ============================================================================
   # GLUE DATABASE + TABLES
@@ -540,13 +514,58 @@ Resources:
   # Analytics Writer Lambda polls this queue to process tag delta notifications.
   # ============================================================================
 
+  # Customer managed key for messaging that AWS services publish to:
+  # EventBridge -> forwarded-events SQS queue, CloudWatch alarm -> SNS topic.
+  # The AWS managed keys (alias/aws/sqs, alias/aws/sns) can't be used by those
+  # service publishers, so they need a key whose policy allows them.
+  MessagingKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: !If [EnableAggressiveCleanup, Delete, Retain]
+    UpdateReplacePolicy: !If [EnableAggressiveCleanup, Delete, Retain]
+    Properties:
+      Description: TagInsights encryption for EventBridge-fed SQS and CloudWatch-fed SNS
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AccountAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: AllowServicePublishers
+            Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+                - cloudwatch.amazonaws.com
+            Action:
+              - kms:GenerateDataKey*
+              - kms:Decrypt
+            Resource: "*"
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref AWS::AccountId
+      Tags:
+        - Key: Application
+          Value: TagInsights
+        - Key: Environment
+          Value: !Ref Environment
+
+  MessagingKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${ProjectName}-messaging-${Environment}"
+      TargetKeyId: !Ref MessagingKey
+
   CentralResultQueue:
     Type: AWS::SQS::Queue
     DeletionPolicy: !If [EnableAggressiveCleanup, Delete, Retain]
     UpdateReplacePolicy: !If [EnableAggressiveCleanup, Delete, Retain]
     Properties:
       QueueName: !Sub "ti-central-results-${Environment}-${AWS::AccountId}"
-      SqsManagedSseEnabled: true
+      KmsMasterKeyId: alias/aws/sqs
       VisibilityTimeout: 1800
       MessageRetentionPeriod: 1209600
       ReceiveMessageWaitTimeSeconds: 20
@@ -565,7 +584,7 @@ Resources:
     UpdateReplacePolicy: !If [EnableAggressiveCleanup, Delete, Retain]
     Properties:
       QueueName: !Sub "ti-central-results-dlq-${Environment}-${AWS::AccountId}"
-      SqsManagedSseEnabled: true
+      KmsMasterKeyId: alias/aws/sqs
       MessageRetentionPeriod: 1209600
       Tags:
         - Key: Application
@@ -587,20 +606,6 @@ Resources:
               AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
             Action: sqs:SendMessage
             Resource: !GetAtt CentralResultQueue.Arn
-          - !If
-            - HasOrganization
-            - Sid: AllowOrganizationAccounts
-              Effect: Allow
-              Principal:
-                AWS: "*"
-              Action: sqs:SendMessage
-              Resource: !GetAtt CentralResultQueue.Arn
-              Condition:
-                StringEquals:
-                  "aws:PrincipalOrgID": !Ref OrganizationId
-                StringNotEquals:
-                  "aws:PrincipalAccount": !Ref AWS::AccountId
-            - !Ref AWS::NoValue
 
   # CloudWatch alarm on DLQ
   CentralResultDLQAlarm:
@@ -625,6 +630,12 @@ Resources:
 # ============================================================================
 
 Outputs:
+  MessagingKeyArn:
+    Description: KMS key for EventBridge-fed SQS and CloudWatch-fed SNS
+    Value: !GetAtt MessagingKey.Arn
+    Export:
+      Name: !Sub "ti-messaging-key-arn-${Environment}"
+
   CentralAnalyticsBucketName:
     Value: !Ref CentralAnalyticsBucket
     Export:
@@ -671,6 +682,6 @@ Outputs:
       Name: !Sub "ti-central-results-queue-arn-${Environment}"
 
   AccessLogsBucketName:
-    Value: !Ref AccessLogsBucket
+    Value: !Ref AccessLogsBucketName
     Export:
       Name: !Sub "ti-access-logs-bucket-${Environment}"

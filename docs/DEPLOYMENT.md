@@ -52,11 +52,13 @@ TagInsights uses the org-wide RE aggregator to scan all accounts from the hub. B
 
 ### 2. AWS CloudTrail (required for real-time events)
 
-Real-time tag tracking (`EnableRealTimeEvents=true`, the default) reacts to
-CloudTrail API-call events such as `TagResource` and `CreateTags`. EventBridge
-only receives these events in accounts and regions where a CloudTrail trail is
-logging management events. Without a trail, nothing is forwarded and tag
-changes appear only after the next scheduled scan.
+Real-time tag tracking (`EnableRealTimeEvents=true`, the default) reacts to the
+native `aws.tag` "Tag Change on Resource" event and to CloudTrail API-call
+events such as `TagResource` and `CreateTags` (which carry the caller
+identity). EventBridge only receives the CloudTrail events in accounts and
+regions where a CloudTrail trail is logging management events. Without a trail,
+only the best-effort native events are forwarded and the scheduled scan
+catches anything missed.
 
 Use a multi-region **organization trail** from the management account so every
 current and future member account is covered:
@@ -84,7 +86,7 @@ storage.
 git clone https://github.com/aws-samples/sample-multi-account-tag-governance-insights.git
 cd sample-multi-account-tag-governance-insights
 
-# Build all 7 Lambda ZIP files
+# Build all 9 Lambda ZIP files
 python3 deployment/package_lambdas.py \
   --cleanup \
   --version "${DEPLOYMENT_VERSION}"
@@ -151,7 +153,7 @@ fi
 # Upload all Lambda packages to immutable versioned keys.
 for package in aggregator_coordinator aggregator_worker analytics_writer \
   monthly_aggregator cost_analyzer_coordinator cost_analyzer_worker \
-  cost_deduplicator; do
+  cost_deduplicator tag_compliance_rule tag_compliance_report; do
   put_immutable \
     deployment/lambda_builds/${package}.zip \
     lambda-packages/v${DEPLOYMENT_VERSION}/${package}.zip
@@ -171,7 +173,7 @@ aws s3 cp deployment/templates/event-forwarder-stack.yaml \
 ```
 
 `DeploymentVersion` is the immutable identity shared by every nested stack and
-all seven Lambda packages. The versioned root template resolves all three nested
+all nine Lambda packages. The versioned root template resolves all three nested
 `TemplateURL` values from `templates/v${DEPLOYMENT_VERSION}/` and forwards the
 same value to every nested stack that deploys Lambda code. Every immutable
 upload includes a base64-encoded SHA-256 checksum, uses AES256 server-side
@@ -230,10 +232,18 @@ Then upload the templates as above and deploy with `ENVIRONMENT=prod`.
 
 ### Option B: AWS CLI
 
+
+> **Prerequisite: access-log bucket.** Set `ACCESS_LOGS_BUCKET` to an existing S3
+> bucket for server access logs, usually your logging baseline's bucket (AWS Control
+> Tower or Landing Zone Accelerator). S3 requires it in the same account and Region,
+> encrypted with SSE-S3 (not SSE-KMS), with a bucket policy granting `s3:PutObject` to
+> `logging.s3.amazonaws.com` ([S3 docs](https://docs.aws.amazon.com/AmazonS3/latest/userguide/enable-server-access-logging.html)).
+
 ```bash
 export BUCKET_NAME="your-taginsights-bucket"
 export REGION="us-east-1"
 export ORG_ID="o-yourorgid"   # optional, for multi-account
+export ACCESS_LOGS_BUCKET="<existing-access-log-bucket>"   # required; see prerequisite
 export AWS_PROFILE="your-hub-account-profile"
 export DEPLOYMENT_VERSION="2026-08-24.1"
 export ENVIRONMENT="test"   # use prod only after "Production code signing" below
@@ -250,6 +260,7 @@ aws cloudformation create-stack \
       ParameterKey=CheckpointSigningSecret,ParameterValue=${CHECKPOINT_SECRET} \
       ParameterKey=HubRegion,ParameterValue=${REGION} \
       ParameterKey=OrganizationId,ParameterValue=${ORG_ID} \
+      ParameterKey=AccessLogsBucketName,ParameterValue=${ACCESS_LOGS_BUCKET} \
   --capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
   --region ${REGION} --profile ${AWS_PROFILE}
 
@@ -264,6 +275,7 @@ aws cloudformation create-stack \
       ParameterKey=CheckpointSigningSecret,ParameterValue=${CHECKPOINT_SECRET} \
       ParameterKey=HubRegion,ParameterValue=${REGION} \
       ParameterKey=OrganizationId,ParameterValue=${ORG_ID} \
+      ParameterKey=AccessLogsBucketName,ParameterValue=${ACCESS_LOGS_BUCKET} \
       ParameterKey=EnableCostAnalysis,ParameterValue=true \
       ParameterKey=CurDatabaseName,ParameterValue=athenacurcfn_cur \
       ParameterKey=CurTableName,ParameterValue=cur \
@@ -343,6 +355,48 @@ aws cloudformation create-stack-instances \
 
 ---
 
+## Optional: Tag Compliance (AWS Config rule)
+
+`deployment/tag-compliance-stack.yaml` is **not** nested in `deploy.yaml`. It
+deploys an organization custom AWS Config rule (`tag_compliance_rule`) and an
+optional daily SES report (`tag_compliance_report`). Deploy it separately in
+the AWS Config delegated administrator (or management) account, once per Region
+you evaluate. Prerequisites: AWS Config recording in member accounts, trusted
+access for Config in AWS Organizations, and an organization Config aggregator
+if you want the report.
+
+1. Deploy `deployment/templates/tag-compliance-member-role.yaml` to every
+   evaluated account with a service-managed StackSet (`HubAccountId` = the
+   delegated administrator account). Also deploy it as a plain stack in the
+   management account if the rule evaluates it.
+2. Upload `tag-compliance-stack.yaml` and deploy it from the delegated
+   administrator account:
+
+```bash
+aws s3 cp deployment/tag-compliance-stack.yaml \
+  s3://${BUCKET_NAME}/templates/v${DEPLOYMENT_VERSION}/tag-compliance-stack.yaml \
+  --profile ${AWS_PROFILE}
+
+aws cloudformation create-stack \
+  --stack-name TagInsights-TagCompliance \
+  --template-url https://${BUCKET_NAME}.s3.amazonaws.com/templates/v${DEPLOYMENT_VERSION}/tag-compliance-stack.yaml \
+  --parameters \
+      ParameterKey=Environment,ParameterValue=${ENVIRONMENT} \
+      ParameterKey=OrganizationId,ParameterValue=o-xxxxxxxxxx \
+      ParameterKey=LambdaCodeBucket,ParameterValue=${BUCKET_NAME} \
+      ParameterKey=DeploymentVersion,ParameterValue=${DEPLOYMENT_VERSION} \
+      'ParameterKey=MemberAccountIds,ParameterValue="111111111111,222222222222"' \
+  --capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
+  --region ${REGION} --profile ${AWS_PROFILE}
+```
+
+`MemberAccountIds` must list every account the rule evaluates, including the
+delegated administrator account. Set `AggregatorName`, `ReportSender`, and
+`ReportRecipients` to enable the daily report. The tag schema is stored in SSM
+Parameter Store (`TagSchema`), so you can change it without redeploying.
+
+---
+
 ## Step 4: Trigger First Scan
 
 After deployment, trigger the first org-wide scan manually:
@@ -407,6 +461,7 @@ For large orgs the response will be `"status": "in_progress"` — re-invoke to r
 | `DeploymentVersion` | Yes            | Immutable version shared by all nested templates and the cost worker artifact             |
 | `HubRegion`        | Yes             | Region where RE aggregator index is deployed (default: `us-east-1`)                       |
 | `OrganizationId`   | Org deployments | AWS Organization ID (e.g., `o-abc123xyz`) — grants member account access to hub resources |
+| `AccessLogsBucketName` | Yes        | Existing S3 server access-log bucket (same account and Region, SSE-S3, bucket policy grants `logging.s3.amazonaws.com`) |
 
 ### Optional Features
 
@@ -511,7 +566,7 @@ python3 deployment/package_lambdas.py \
   --version "${DEPLOYMENT_VERSION}"
 for package in aggregator_coordinator aggregator_worker analytics_writer \
   monthly_aggregator cost_analyzer_coordinator cost_analyzer_worker \
-  cost_deduplicator; do
+  cost_deduplicator tag_compliance_rule tag_compliance_report; do
   put_immutable \
     deployment/lambda_builds/${package}.zip \
     lambda-packages/v${DEPLOYMENT_VERSION}/${package}.zip
@@ -533,6 +588,7 @@ aws cloudformation update-stack \
       ParameterKey=DeploymentVersion,ParameterValue=${DEPLOYMENT_VERSION} \
       ParameterKey=HubRegion,UsePreviousValue=true \
       ParameterKey=OrganizationId,UsePreviousValue=true \
+      ParameterKey=AccessLogsBucketName,UsePreviousValue=true \
   --capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
   --profile ${AWS_PROFILE}
 ```
@@ -562,8 +618,9 @@ aws cloudformation delete-stack-set \
 echo "TagInsights removed successfully"
 ```
 
-> **Note:** S3 buckets with `DeletionPolicy: Retain` (prod analytics bucket, access logs) are kept after stack deletion
-> to protect data. Delete them manually if needed.
+> **Note:** S3 buckets with `DeletionPolicy: Retain` (prod analytics bucket) are kept after stack deletion to protect
+> data. Delete them manually if needed. The access-log bucket (`AccessLogsBucketName`) is yours and is not managed by
+> the stacks.
 
 ---
 
