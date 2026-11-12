@@ -340,6 +340,7 @@ class TestGetCostsForResources:
             "data": [
                 {
                     "resource_id": "i-abc",
+                    "service_name": "Amazon Elastic Compute Cloud",
                     "monthly_cost": "10.5",
                     "usage_records": "5",
                     "avg_daily_cost": "0.35",
@@ -389,8 +390,9 @@ class TestGetCostsForResources:
             matcher_with_cur.query_builder
             .build_direct_arn_costs_query.call_args.args
         )
+        # Full DynamoDB ARN still reaches CUR; one mixed-service query per batch.
         assert query_args[0] == [resource_arn]
-        assert query_args[1] == "dynamodb"
+        assert query_args[1] == "unknown"
         assert results[0]["monthly_cost"] == 0.25
         assert results[0]["matched_in_cur"] is True
 
@@ -429,7 +431,7 @@ class TestProcessS3ResourceBatch:
             ]
         }
         res = [{"resource_arn": "arn:aws:s3:::my-bucket", "service_type": "s3"}]
-        results = matcher_with_cur._process_s3_resource_batch(res, months_back=1)
+        results = matcher_with_cur._process_mixed_batch(res, months_back=1)
         assert results[0]["monthly_cost"] == 5.0
         assert "s3_search_formats" in results[0]
 
@@ -439,7 +441,7 @@ class TestProcessS3ResourceBatch:
         )
         matcher_with_cur.cur_provider._execute_athena_query.return_value = {"data": []}
         res = [{"resource_arn": "arn:aws:s3:::unknown", "service_type": "s3"}]
-        results = matcher_with_cur._process_s3_resource_batch(res, months_back=1)
+        results = matcher_with_cur._process_mixed_batch(res, months_back=1)
         assert results[0]["monthly_cost"] == 0.0
 
 
@@ -620,3 +622,95 @@ def test_direct_matcher_retains_fifty_resource_batch_bound():
     batches = list(matcher._batch_resources([{"id": i} for i in range(101)], 50))
 
     assert [len(batch) for batch in batches] == [50, 50, 1]
+
+
+class TestBothIdFormsQueried:
+    """CUR uses a full ARN for some types and a bare ID for others; match either."""
+
+    EKS = "arn:aws:eks:us-east-1:123456789012:cluster/example-cluster"
+
+    def _run(self, matcher, service, arn, cur_rows):
+        with patch.object(matcher, "_query_cur_for_arns", return_value=cur_rows) as q:
+            out = matcher._process_mixed_batch([{"resource_arn": arn, "service_type": service}], 1)
+        return out[0], q.call_args.args[0]
+
+    def test_full_arn_match_when_normalizer_shortens(self, matcher_no_cur):
+        row = {"monthly_cost": 131.4, "usage_records": 10, "avg_daily_cost": 13.14,
+               "first_usage": "2026-11-01", "last_usage": "2026-11-10", "matched_in_cur": True}
+        result, queried = self._run(matcher_no_cur, "eks", self.EKS, {self.EKS: row})
+        assert self.EKS in queried
+        assert result["monthly_cost"] == 131.4 and result["matched_in_cur"] is True
+
+    def test_both_forms_summed_once_each(self, matcher_no_cur):
+        arn = "arn:aws:ec2:us-east-1:123456789012:instance/i-0abc"
+        short = matcher_no_cur._normalize_arn_for_cur(arn, "ec2")
+        assert short != arn
+        rows = {short: {"monthly_cost": 10.0, "usage_records": 1, "avg_daily_cost": 1.0,
+                        "first_usage": "2026-11-02", "last_usage": "2026-11-05"},
+                arn: {"monthly_cost": 2.5, "usage_records": 1, "avg_daily_cost": 0.25,
+                      "first_usage": "2026-11-01", "last_usage": "2026-11-09"}}
+        result, queried = self._run(matcher_no_cur, "ec2", arn, rows)
+        assert sorted(queried) == sorted([short, arn])
+        assert result["monthly_cost"] == 12.5
+        assert (result["first_usage"], result["last_usage"]) == ("2026-11-01", "2026-11-09")
+
+    def test_no_match_is_zero(self, matcher_no_cur):
+        result, _ = self._run(matcher_no_cur, "eks", self.EKS, {})
+        assert result["monthly_cost"] == 0.0 and result["matched_in_cur"] is False
+
+
+def test_multiple_service_rows_summed_not_overwritten(matcher_no_cur):
+    """A $0 'AWS Data Transfer' row must not overwrite the resource's real cost."""
+    arn = "arn:aws:rds:us-east-1:123456789012:db:pg"
+    rows = [
+        {"resource_id": arn, "monthly_cost": "4.87", "usage_records": "240", "avg_daily_cost": "0.02",
+         "first_usage": "2026-11-01", "last_usage": "2026-11-10"},
+        {"resource_id": arn, "monthly_cost": "0.0", "usage_records": "3", "avg_daily_cost": "0",
+         "first_usage": "2026-11-02", "last_usage": "2026-11-03"},
+    ]
+    matcher_no_cur.query_builder = MagicMock()
+    matcher_no_cur.query_builder.build_direct_arn_costs_query.return_value = "SELECT 1"
+    matcher_no_cur.cur_provider = MagicMock()
+    matcher_no_cur.cur_provider._execute_athena_query.return_value = {"data": rows}
+    out = matcher_no_cur._query_cur_for_arns([arn], "rds", 1)
+    assert out[arn]["monthly_cost"] == 4.87
+    assert out[arn]["usage_records"] == 243
+
+
+def test_s3_cost_summed_across_name_and_arn_forms(matcher_no_cur):
+    arn = "arn:aws:s3:::my-bucket"
+    rows = {arn: {"monthly_cost": 0.0, "usage_records": 1, "avg_daily_cost": 0.0, "first_usage": "", "last_usage": ""},
+            "my-bucket": {"monthly_cost": 0.31, "usage_records": 9, "avg_daily_cost": 0.03, "first_usage": "", "last_usage": ""}}
+    with patch.object(matcher_no_cur, "_query_cur_for_arns", return_value=rows):
+        out = matcher_no_cur._process_mixed_batch([{"resource_arn": arn, "service_type": "s3"}], 1)
+    assert out[0]["monthly_cost"] == 0.31
+
+
+
+def test_mixed_services_priced_with_one_query(matcher_no_cur):
+    eks = "arn:aws:eks:us-east-1:123456789012:cluster/c1"
+    bucket = "arn:aws:s3:::b1"
+    res = [{"resource_arn": eks, "service_type": "eks"}, {"resource_arn": bucket, "service_type": "s3"}]
+    rows = {eks: {"monthly_cost": 131.4, "usage_records": 1}, "b1": {"monthly_cost": 0.3, "usage_records": 1}}
+    with patch.object(matcher_no_cur, "_query_cur_for_arns", return_value=rows) as q:
+        out = matcher_no_cur._process_mixed_batch(res, 1)
+    assert q.call_count == 1
+    assert [r["monthly_cost"] for r in out] == [131.4, 0.3]
+
+
+def test_bare_id_row_from_other_service_ignored(matcher_no_cur):
+    """'default' as an EventBridge bus must not pick up another service's 'default' line items."""
+    rows = [
+        {"resource_id": "default", "service_name": "Amazon Elastic Compute Cloud", "monthly_cost": "9.0",
+         "usage_records": "1", "avg_daily_cost": "0", "first_usage": "", "last_usage": ""},
+        {"resource_id": "arn:aws:events:us-east-1:1:event-bus/default", "service_name": "Amazon EventBridge",
+         "monthly_cost": "0.5", "usage_records": "1", "avg_daily_cost": "0", "first_usage": "", "last_usage": ""},
+    ]
+    matcher_no_cur.query_builder = MagicMock()
+    matcher_no_cur.query_builder.build_direct_arn_costs_query.return_value = "SELECT 1"
+    matcher_no_cur.cur_provider = MagicMock()
+    matcher_no_cur.cur_provider._execute_athena_query.return_value = {"data": rows}
+    out = matcher_no_cur._query_cur_for_arns(
+        ["default", "arn:aws:events:us-east-1:1:event-bus/default"], "unknown", 1, {"default": {"events"}})
+    assert "default" not in out
+    assert out["arn:aws:events:us-east-1:1:event-bus/default"]["monthly_cost"] == 0.5

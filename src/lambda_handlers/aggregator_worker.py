@@ -21,7 +21,7 @@ State storage:
     Very large account+regions are not sharded automatically.
 
 Delta storage:
-  s3://{CENTRAL_ANALYTICS_BUCKET}/deltas/account_id={account}/region={region}/{timestamp}-{scan_id}.json
+  s3://{CENTRAL_ANALYTICS_BUCKET}/deltas/account_id={account}/region={region}/{timestamp}-{scan_id}-{random8}.json
   - One file per worker invocation
   - Partitioned for Athena queries by account_id and region
 """
@@ -31,11 +31,13 @@ import gzip
 import os
 import re
 import time
+import uuid
 import logging
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 import boto3
+from botocore.config import Config
 
 logger = logging.getLogger()
 logger.setLevel(os.environ.get('LOG_LEVEL', 'WARNING'))
@@ -49,6 +51,13 @@ CENTRAL_ANALYTICS_BUCKET = os.environ.get('CENTRAL_ANALYTICS_BUCKET', '')
 STATE_SHARD_THRESHOLD = int(os.environ.get('STATE_SHARD_THRESHOLD', '50000'))
 
 # ── AWS clients ───────────────────────────────────────────────────────────────
+# Resource Explorer quotas are low and not adjustable (Search: 5 TPS). Adaptive
+# retries back off client-side; Worker ReservedConcurrentExecutions caps how
+# many containers share that budget.
+# Limitation: per-container rate limiting only; add a shared token bucket if
+# throttling still exhausts retries at high worker concurrency.
+RE_CLIENT_CONFIG = Config(retries={'mode': 'adaptive', 'max_attempts': 10})
+
 s3 = boto3.client('s3')
 sqs = boto3.client('sqs')
 
@@ -191,8 +200,11 @@ def state_key(account_id: str, region: str) -> str:
 
 
 def delta_key(account_id: str, region: str, scan_id: str) -> str:
+    # Random suffix: two writes in the same second (e.g. two real-time events in
+    # one SQS batch) would otherwise share a key and the second would overwrite
+    # the first, silently dropping a delta.
     timestamp = datetime.utcnow().strftime('%Y-%m-%d-%H-%M-%S')
-    return f"deltas/account_id={account_id}/region={region}/{timestamp}-{scan_id}.json"
+    return f"deltas/account_id={account_id}/region={region}/{timestamp}-{scan_id}-{uuid.uuid4().hex[:8]}.json"
 
 
 def read_state(account_id: str, region: str) -> Dict[str, Dict]:
@@ -210,9 +222,8 @@ def read_state(account_id: str, region: str) -> Dict[str, Dict]:
     except s3.exceptions.NoSuchKey:
         logger.info(f"No previous state for {account_id}/{region} — first scan")
         return {}
-    except Exception as e:
-        logger.warning(f"Error reading state for {account_id}/{region}: {e}")
-        return {}
+    # Any other error propagates: treating an unreadable state as empty would
+    # re-emit every resource as new_resource and corrupt the delta history.
 
 
 def write_state(account_id: str, region: str, state: Dict[str, Dict]):
@@ -269,59 +280,50 @@ def discover_resources_for_account_region(
     region: str
 ) -> Dict[str, Dict]:
     """
-    Query Resource Explorer aggregator index for all resources in the given
-    account+region. Returns {arn: {tag_key: tag_value}} dict.
+    List every resource in one account+region from the Resource Explorer
+    aggregator index. Returns {arn: {tag_key: tag_value}}.
 
-    Uses the Search API with account and region filters so the aggregator
-    index returns only resources scoped to this account+region pair.
-    This keeps each worker bounded and avoids loading the full org inventory.
+    Uses ListResources, not Search: Search returns at most 1,000 results per
+    query even when paginated, which silently truncates larger account+regions.
+
+    Raises on any API error. A partial or empty inventory must never be
+    written as state, or the next delta would report live resources as removed.
     """
-    re_client = boto3.client('resource-explorer-2', region_name=HUB_REGION)
+    re_client = boto3.client('resource-explorer-2', region_name=HUB_REGION, config=RE_CLIENT_CONFIG)
     resources = {}
 
-    # RE Search query: filter by account and region
-    # RE query syntax: accountid:{account} region:{region}
-    query_string = f"accountid:{account_id} region:{region}"
+    list_kwargs = {
+        'Filters': {'FilterString': f"accountid:{account_id} region:{region}"},
+        'MaxResults': 1000,
+    }
+    org_view_arn = get_org_view_arn()
+    if org_view_arn:
+        list_kwargs['ViewArn'] = org_view_arn
 
-    try:
-        paginator = re_client.get_paginator('search')
-        page_count = 0
+    page_count = 0
+    for page in re_client.get_paginator('list_resources').paginate(**list_kwargs):
+        page_count += 1
+        for resource in page.get('Resources', []):
+            arn = resource.get('Arn', '')
+            if arn:
+                resources[arn] = extract_tags_from_re_resource(resource)
 
-        # Use org-wide aggregator view if available, otherwise use default
-        org_view_arn = get_org_view_arn()
-        search_kwargs = {'QueryString': query_string}
-        if org_view_arn:
-            search_kwargs['ViewArn'] = org_view_arn
-
-        for page in paginator.paginate(**search_kwargs):
-            page_count += 1
-            for resource in page.get('Resources', []):
-                arn = resource.get('Arn', '')
-                if not arn:
-                    continue
-
-                # Extract tags from RE response
-                # RE returns tags as a list of {Key, Value} dicts under Properties
-                tags = {}
-                for prop in resource.get('Properties', []):
-                    if prop.get('Name') == 'tags':
-                        for tag in prop.get('Data', []):
-                            if isinstance(tag, dict) and 'Key' in tag and 'Value' in tag:
-                                tags[tag['Key']] = tag['Value']
-
-                resources[arn] = tags
-
-        logger.info(
-            f"RE discovery for {account_id}/{region}: "
-            f"{len(resources)} resources across {page_count} pages"
-        )
-
-    except re_client.exceptions.UnauthorizedException as e:
-        logger.error(f"RE not enabled or no aggregator index for {account_id}/{region}: {e}")
-    except Exception as e:
-        logger.error(f"RE discovery failed for {account_id}/{region}: {e}")
-
+    logger.info(
+        f"RE discovery for {account_id}/{region}: "
+        f"{len(resources)} resources across {page_count} pages"
+    )
     return resources
+
+
+def extract_tags_from_re_resource(resource: Dict) -> Dict[str, str]:
+    """Tags are inline under Properties[Name=tags].Data when the view includes tags."""
+    tags = {}
+    for prop in resource.get('Properties', []):
+        if prop.get('Name') == 'tags':
+            for tag in prop.get('Data', []):
+                if isinstance(tag, dict) and 'Key' in tag and 'Value' in tag:
+                    tags[tag['Key']] = tag['Value']
+    return tags
 
 
 # ── Delta computation ─────────────────────────────────────────────────────────
@@ -623,6 +625,64 @@ def process_real_time_event(event: Dict) -> Dict:
     }
 
 
+TAG_CHANGE_DETAIL_TYPE = 'Tag Change on Resource'
+
+
+def process_tag_change_event(event: Dict) -> Dict:
+    """
+    Process a native EventBridge "Tag Change on Resource" event (source aws.tag).
+
+    Unlike CloudTrail tag APIs, whose names differ per service (CreateTags,
+    PutBucketTagging, TagQueue, ...) and which miss tags set at creation, this
+    event fires for tags set at creation too and carries the resource's full
+    tag set, so state is replaced rather than patched. It has no caller
+    identity; "who" still comes from the CloudTrail path.
+    """
+    account_id = event.get('account', '')  # EventBridge envelope, set by AWS
+    region = event.get('region', HUB_REGION)
+    detail = event.get('detail', {}) or {}
+    tags = detail.get('tags') or {}
+    arns = [a for a in event.get('resources', []) if isinstance(a, str) and a.startswith('arn:')]
+
+    if not account_id or not arns or not isinstance(tags, dict):
+        logger.warning("Malformed Tag Change on Resource event; skipping")
+        return {'trigger': 'tag_change_event', 'deltas_written': 0}
+
+    tags = {str(k): str(v) for k, v in tags.items()}
+    previous_state = read_state(account_id, region)
+    now = int(time.time())
+    deltas = []
+    for arn in arns:
+        arn_account = arn.split(':')[4] if arn.count(':') >= 5 else ''
+        if arn_account and arn_account != account_id:
+            logger.warning(f"Tag change ARN account {arn_account} != envelope {account_id}; skipping")
+            continue
+        previous_tags = previous_state.get(arn)
+        if previous_tags == tags:
+            continue  # already recorded (CloudTrail path or scan got there first)
+        deltas.append({
+            'arn': arn,
+            'resource_type': extract_service_from_arn(arn),
+            'tags': tags,
+            'previous_tags': previous_tags or {},
+            'change_type': 'new_resource' if previous_tags is None else 'tags_changed',
+            'timestamp': now,
+            'source_system': 'aggregator_worker_tag_event',
+            'account_id': account_id,
+            'region': region,
+            'scan_id': f"tag_event_{now}",
+        })
+        previous_state[arn] = tags
+
+    if deltas:
+        delta_s3_key = write_deltas(account_id, region, f"tag_event_{now}", deltas)
+        notify_results_q(account_id, region, delta_s3_key, len(deltas))
+        write_state(account_id, region, previous_state)
+
+    return {'trigger': 'tag_change_event', 'account_id': account_id,
+            'region': region, 'deltas_written': len(deltas)}
+
+
 # ── Full account+region scan ──────────────────────────────────────────────────
 
 def process_account_region_scan(account_id: str, region: str, scan_id: str) -> Dict:
@@ -639,20 +699,6 @@ def process_account_region_scan(account_id: str, region: str, scan_id: str) -> D
 
     # Discover current resources
     current = discover_resources_for_account_region(account_id, region)
-
-    if not current and account_id:
-        # RE returned nothing — could be an empty account, or RE not enabled
-        # Write empty state and return (don't fail the coordinator)
-        logger.info(f"No resources found for {account_id}/{region} — skipping delta computation")
-        write_state(account_id, region, {})
-        return {
-            'account_id': account_id,
-            'region': region,
-            'scan_id': scan_id,
-            'total_resources': 0,
-            'deltas': 0,
-            'duration_seconds': round(time.time() - start, 1)
-        }
 
     # Read previous state
     previous = read_state(account_id, region)
@@ -717,8 +763,9 @@ def lambda_handler(event, context):
             try:
                 body = json.loads(record['body'])
                 if body.get('detail-type') == 'AWS API Call via CloudTrail':
-                    result = process_real_time_event(body)
-                    results.append(result)
+                    results.append(process_real_time_event(body))
+                elif body.get('detail-type') == TAG_CHANGE_DETAIL_TYPE:
+                    results.append(process_tag_change_event(body))
                 else:
                     logger.warning(f"Unknown SQS message type: {list(body.keys())}")
             except Exception as e:
@@ -731,6 +778,8 @@ def lambda_handler(event, context):
     # ── Direct EventBridge event (real-time, non-SQS path) ───────────────────
     if event.get('detail-type') == 'AWS API Call via CloudTrail':
         return process_real_time_event(event)
+    if event.get('detail-type') == TAG_CHANGE_DETAIL_TYPE:
+        return process_tag_change_event(event)
 
     # ── Coordinator scan job ──────────────────────────────────────────────────
     account_id = event.get('account_id', '')

@@ -1,0 +1,318 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::LanguageExtensions
+Description: >
+  TagInsights - Tag Compliance Stack (Step 2). Organization custom AWS Config rule that
+  validates required tags, allowed values, and multi-value fields, plus an optional daily
+  compliance report by Amazon SES. Deploy in the AWS Config delegated administrator (or
+  management) account, once per Region you evaluate. Prerequisites: AWS Config recording in
+  member accounts, trusted access for Config in AWS Organizations, an organization Config
+  aggregator (for the report), and templates/tag-compliance-member-role.yaml deployed to
+  every account (StackSet) so this Lambda can call PutEvaluations there.
+  Deploy with --capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND (Fn::ForEach),
+  and list every evaluated account in MemberAccountIds.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: ti
+
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, test, cert, uat, staging, prod]
+
+  OrganizationId:
+    Type: String
+    AllowedPattern: "^o-[a-z0-9]{10,32}$"
+    Description: AWS Organizations ID. Limits which accounts' evaluation roles the rule Lambda may assume.
+
+  LambdaCodeBucket:
+    Type: String
+    Description: S3 bucket containing pre-built Lambda deployment packages
+
+  DeploymentVersion:
+    Type: String
+    AllowedPattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+    Description: Immutable version segment shared by all Lambda ZIPs.
+
+  TagSchema:
+    Type: String
+    Description: >
+      JSON tag schema stored in SSM Parameter Store and read by the rule at runtime (not passed
+      as rule parameters, which Config caps at 1,024 characters). Update the parameter to change
+      the schema without redeploying the rule.
+    Default: >-
+      {"delimiter":"+","requiredTags":[
+      {"key":"Environment","allowed_values":["Production","Staging","Development"]},
+      {"key":"Application","allowed_values":["Payments","Trading","Risk"]},
+      {"key":"CostCenter","allowed_values":["CC-100","CC-200","CC-300"]},
+      {"key":"Region","allowed_values":["NA","EMEA","APAC"]},
+      {"key":"BusinessLine","allowed_values":["Retail","Institutional","Wealth"]},
+      {"key":"CustomerName","multi_value":true,"allowed_values":["ACME","GLOBEX","INITECH","UMBRELLA"]}]}
+
+  ResourceTypesScope:
+    Type: CommaDelimitedList
+    Default: "AWS::EC2::Instance,AWS::EC2::Volume,AWS::EC2::SecurityGroup,AWS::S3::Bucket,AWS::RDS::DBInstance,AWS::Lambda::Function,AWS::DynamoDB::Table,AWS::SQS::Queue,AWS::SNS::Topic"
+    Description: Resource types the rule evaluates (max 100).
+
+  MemberAccountIds:
+    Type: CommaDelimitedList
+    Description: >
+      Account IDs whose AWS Config may invoke the rule function (every account the
+      organization rule evaluates, including this one). Config invokes the function
+      cross-account as the config.amazonaws.com service principal; the only Lambda
+      permission condition it satisfies is SourceAccount (live test: PrincipalOrgID
+      returns AccessDenied), so one permission is created per account.
+
+  ExcludedAccounts:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: Account IDs to exclude from the organization rule.
+
+  AggregatorName:
+    Type: String
+    Default: ""
+    Description: Organization Config aggregator name in this account. Leave empty to skip the daily report.
+
+  ReportSender:
+    Type: String
+    Default: ""
+    Description: Verified SES identity used as the From address.
+
+  ReportRecipients:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: >
+      Report recipients. In the SES sandbox these must be verified addresses; a distribution
+      list requires SES production access.
+
+  ReportSchedule:
+    Type: String
+    Default: "cron(0 13 * * ? *)"
+
+  LogLevel:
+    Type: String
+    Default: WARNING
+    AllowedValues: [DEBUG, INFO, WARNING, ERROR]
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, "prod"]
+  HasExcludedAccounts: !Not [!Equals [!Join ["", !Ref ExcludedAccounts], ""]]
+  EnableReport: !And
+    - !Not [!Equals [!Ref AggregatorName, ""]]
+    - !Not [!Equals [!Ref ReportSender, ""]]
+    - !Not [!Equals [!Join ["", !Ref ReportRecipients], ""]]
+
+Resources:
+  # ============================================================================
+  # TAG SCHEMA
+  # ============================================================================
+
+  TagSchemaParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ProjectName}/${Environment}/tag-compliance/schema"
+      Type: String
+      Tier: Intelligent-Tiering
+      Value: !Ref TagSchema
+      Description: TagInsights required-tag schema (requiredTags, allowed_values, multi_value, delimiter)
+
+  # ============================================================================
+  # CONFIG RULE LAMBDA
+  # ============================================================================
+
+  RuleFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      # Member-account evaluation roles trust this name pattern.
+      RoleName: !Sub "${ProjectName}-tag-compliance-rule-${AWS::Region}-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: TagComplianceRulePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/${Environment}/tag-compliance/schema"
+              # PutEvaluations must run in the account that owns the resource.
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: !Sub "arn:${AWS::Partition}:iam::*:role/${ProjectName}-tag-compliance-eval-${Environment}"
+                Condition:
+                  StringEquals:
+                    aws:ResourceOrgID: !Ref OrganizationId
+
+  RuleCodeSigningConfig:
+    Type: AWS::Lambda::CodeSigningConfig
+    Condition: IsProduction
+    Properties:
+      Description: !Sub "TagInsights tag compliance code signing - ${Environment}"
+      AllowedPublishers:
+        SigningProfileVersionArns:
+          - !Sub "arn:${AWS::Partition}:signer:${AWS::Region}:${AWS::AccountId}:/signing-profiles/taginsights-lambda-signer"
+      CodeSigningPolicies:
+        UntrustedArtifactOnDeployment: Enforce
+
+  RuleFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-tag-compliance-rule-${Environment}"
+      Runtime: python3.11
+      Handler: tag_compliance_rule.lambda_handler
+      Role: !GetAtt RuleFunctionRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      ReservedConcurrentExecutions: 20
+      CodeSigningConfigArn: !If [IsProduction, !Ref RuleCodeSigningConfig, !Ref AWS::NoValue]
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !If
+          - IsProduction
+          - !Sub "signed/v${DeploymentVersion}/tag_compliance_rule.zip"
+          - !Sub "lambda-packages/v${DeploymentVersion}/tag_compliance_rule.zip"
+      Environment:
+        Variables:
+          SCHEMA_PARAMETER: !Ref TagSchemaParameter
+          EXECUTION_ROLE_NAME: !Sub "${ProjectName}-tag-compliance-eval-${Environment}"
+          LOG_LEVEL: !Ref LogLevel
+      Tags:
+        - Key: Application
+          Value: TagInsights
+        - Key: Environment
+          Value: !Ref Environment
+
+  # One invoke permission per member account, each pinned with SourceAccount.
+  # ponytail: account list is a parameter; add accounts on org growth, or move to
+  # a Lambda-backed custom resource that reads Organizations if that gets tedious.
+  Fn::ForEach::RuleFunctionConfigPermissions:
+    - AccountId
+    - !Ref MemberAccountIds
+    - RuleFunctionConfigPermission${AccountId}:
+        Type: AWS::Lambda::Permission
+        Properties:
+          FunctionName: !GetAtt RuleFunction.Arn
+          Action: lambda:InvokeFunction
+          Principal: config.amazonaws.com
+          SourceAccount: !Ref AccountId
+
+  OrganizationTagRule:
+    Type: AWS::Config::OrganizationConfigRule
+    Properties:
+      OrganizationConfigRuleName: !Sub "${ProjectName}-required-tags-${Environment}"
+      ExcludedAccounts: !If [HasExcludedAccounts, !Ref ExcludedAccounts, !Ref AWS::NoValue]
+      OrganizationCustomRuleMetadata:
+        Description: Required tags, allowed values, and multi-value tag validation (TagInsights)
+        LambdaFunctionArn: !GetAtt RuleFunction.Arn
+        OrganizationConfigRuleTriggerTypes:
+          - ConfigurationItemChangeNotification
+          - OversizedConfigurationItemChangeNotification
+        ResourceTypesScope: !Ref ResourceTypesScope
+
+  # ============================================================================
+  # DAILY COMPLIANCE REPORT (optional)
+  # ============================================================================
+
+  ReportFunctionRole:
+    Type: AWS::IAM::Role
+    Condition: EnableReport
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: TagComplianceReportPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - config:DescribeAggregateComplianceByConfigRules
+                  - config:GetAggregateComplianceDetailsByConfigRule
+                Resource: !Sub "arn:${AWS::Partition}:config:${AWS::Region}:${AWS::AccountId}:config-aggregator/*"
+              - Effect: Allow
+                Action: ses:SendEmail
+                Resource: !Sub "arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/*"
+                Condition:
+                  StringEquals:
+                    ses:FromAddress: !Ref ReportSender
+
+  ReportFunction:
+    Type: AWS::Lambda::Function
+    Condition: EnableReport
+    Properties:
+      FunctionName: !Sub "${ProjectName}-tag-compliance-report-${Environment}"
+      Runtime: python3.11
+      Handler: tag_compliance_report.lambda_handler
+      Role: !GetAtt ReportFunctionRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      CodeSigningConfigArn: !If [IsProduction, !Ref RuleCodeSigningConfig, !Ref AWS::NoValue]
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !If
+          - IsProduction
+          - !Sub "signed/v${DeploymentVersion}/tag_compliance_report.zip"
+          - !Sub "lambda-packages/v${DeploymentVersion}/tag_compliance_report.zip"
+      Environment:
+        Variables:
+          AGGREGATOR_NAME: !Ref AggregatorName
+          RULE_NAME: !Sub "${ProjectName}-required-tags-${Environment}"
+          SENDER: !Ref ReportSender
+          RECIPIENTS: !Join [",", !Ref ReportRecipients]
+          LOG_LEVEL: !Ref LogLevel
+      Tags:
+        - Key: Application
+          Value: TagInsights
+        - Key: Environment
+          Value: !Ref Environment
+
+  ReportScheduleRule:
+    Type: AWS::Events::Rule
+    Condition: EnableReport
+    Properties:
+      Name: !Sub "${ProjectName}-tag-compliance-report-${Environment}"
+      ScheduleExpression: !Ref ReportSchedule
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ReportFunction.Arn
+          Id: TagComplianceReport
+
+  ReportSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Condition: EnableReport
+    Properties:
+      FunctionName: !Ref ReportFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !GetAtt ReportScheduleRule.Arn
+
+Outputs:
+  RuleFunctionRoleArn:
+    Description: Pass to tag-compliance-member-role.yaml (HubAccountId) so member roles trust it
+    Value: !GetAtt RuleFunctionRole.Arn
+  OrganizationConfigRuleName:
+    Value: !Ref OrganizationTagRule
+  TagSchemaParameterName:
+    Value: !Ref TagSchemaParameter

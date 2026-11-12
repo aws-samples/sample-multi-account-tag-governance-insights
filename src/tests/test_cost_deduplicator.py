@@ -24,7 +24,7 @@ def mock_env(monkeypatch):
     monkeypatch.setenv("AWS_REGION", "us-east-1")
     monkeypatch.setenv("ATHENA_DATABASE", "ti_test_db")
     monkeypatch.setenv("ATHENA_WORKGROUP", "test-workgroup")
-    monkeypatch.setenv("S3_BUCKET", "test-cost-bucket")
+    monkeypatch.setenv("S3_BUCKET", "amzn-s3-demo-cost-bucket")
     monkeypatch.setenv("ATHENA_OUTPUT_BUCKET", "test-athena-output")
 
 
@@ -147,7 +147,7 @@ def test_dedup_success():
     glue.get_table.return_value = {
         "Table": {
             "StorageDescriptor": {
-                "Location": "s3://test-cost-bucket/out/",
+                "Location": "s3://amzn-s3-demo-cost-bucket/out/",
                 "Columns": [{"Name": "x", "Type": "string"}],
                 "InputFormat": "pi",
                 "OutputFormat": "po",
@@ -185,7 +185,7 @@ def test_dedup_partial_failure():
     glue.get_table.return_value = {
         "Table": {
             "StorageDescriptor": {
-                "Location": "s3://test-cost-bucket/o/",
+                "Location": "s3://amzn-s3-demo-cost-bucket/o/",
                 "Columns": [],
                 "InputFormat": "x",
                 "OutputFormat": "x",
@@ -266,7 +266,7 @@ def test_copy_files():
             {"Key": "out/f.crc"},
         ]
     }
-    assert d._copy_s3_files("s3://test-cost-bucket/out/", "dest/") == 2
+    assert d._copy_s3_files("s3://amzn-s3-demo-cost-bucket/out/", "dest/") == 2
     assert s3.copy_object.call_count == 2
 
 
@@ -278,7 +278,7 @@ def test_copy_invalid_source():
 def test_copy_empty():
     d, s3, *_ = _build()
     s3.list_objects_v2.return_value = {"Contents": []}
-    assert d._copy_s3_files("s3://b/p/", "dest/") == 0
+    assert d._copy_s3_files("s3://amzn-s3-demo-bucket/p/", "dest/") == 0
 
 
 # --- _add_monthly_partition ---
@@ -291,7 +291,7 @@ def test_add_partition_new():
         "Table": {
             "StorageDescriptor": {
                 "Columns": [{"Name": "x", "Type": "s"}],
-                "Location": "s3://b/",
+                "Location": "s3://amzn-s3-demo-bucket/",
                 "InputFormat": "i",
                 "OutputFormat": "o",
                 "SerdeInfo": {"SerializationLibrary": "s"},
@@ -321,7 +321,7 @@ def test_add_partition_error():
         "Table": {
             "StorageDescriptor": {
                 "Columns": [],
-                "Location": "s3://b/",
+                "Location": "s3://amzn-s3-demo-bucket/",
                 "InputFormat": "x",
                 "OutputFormat": "x",
                 "SerdeInfo": {"SerializationLibrary": "x"},
@@ -390,7 +390,7 @@ def test_dedup_account_success():
     d, s3, glue, _, athena = _build()
     athena.execute_query.return_value = [{"row_count": "100"}]
     glue.get_table.return_value = {
-        "Table": {"StorageDescriptor": {"Location": "s3://test-cost-bucket/out/"}}
+        "Table": {"StorageDescriptor": {"Location": "s3://amzn-s3-demo-cost-bucket/out/"}}
     }
     s3.list_objects_v2.return_value = {"Contents": [{"Key": "out/part-00000"}]}
     assert d._deduplicate_account_month("123456789012", 2025, 6, 15) == 100

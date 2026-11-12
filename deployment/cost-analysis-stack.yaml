@@ -128,12 +128,14 @@ Resources:
     UpdateReplacePolicy: !If [EnableAggressiveCleanup, Delete, Retain]
     Properties:
       QueueName: !Sub "${ProjectName}-cost-analysis-work-${Environment}.fifo"
-      SqsManagedSseEnabled: true
+      KmsMasterKeyId: alias/aws/sqs
       FifoQueue: true
       ContentBasedDeduplication: true
       DeduplicationScope: messageGroup
       FifoThroughputLimit: perMessageGroupId
-      VisibilityTimeout: 300
+      # >= 6x the Worker timeout (300 s), per AWS guidance for SQS event sources,
+      # so a slow batch is never redelivered while still being processed.
+      VisibilityTimeout: 1800
       MessageRetentionPeriod: 86400
       ReceiveMessageWaitTimeSeconds: 20
       RedrivePolicy:
@@ -153,7 +155,7 @@ Resources:
     UpdateReplacePolicy: !If [EnableAggressiveCleanup, Delete, Retain]
     Properties:
       QueueName: !Sub "${ProjectName}-cost-analysis-dlq-${Environment}.fifo"
-      SqsManagedSseEnabled: true
+      KmsMasterKeyId: alias/aws/sqs
       FifoQueue: true
       MessageRetentionPeriod: 1209600
       Tags:
@@ -690,6 +692,7 @@ Resources:
       FunctionName: !Ref CostAnalyzerCoordinatorLambda
       Action: lambda:InvokeFunction
       Principal: events.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
       SourceArn: !GetAtt CostAnalysisSchedule.Arn
 
   # ============================================================================
@@ -774,6 +777,9 @@ Resources:
     Type: AWS::SNS::Topic
     Properties:
       TopicName: !Sub "${ProjectName}-cost-dedup-trigger-${Environment}"
+      # Publisher is a CloudWatch alarm, so the AWS managed SNS key won't work.
+      KmsMasterKeyId: !ImportValue
+        Fn::Sub: "ti-messaging-key-arn-${Environment}"
       DisplayName: "Cost Analysis Deduplication Trigger"
       Tags:
         - Key: Project
@@ -794,6 +800,7 @@ Resources:
       FunctionName: !Ref CostDeduplicatorLambda
       Action: lambda:InvokeFunction
       Principal: sns.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
       SourceArn: !Ref DeduplicationTopic
 
   # ============================================================================

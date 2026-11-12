@@ -481,7 +481,9 @@ class CURCostProvider:
             Dict: Execution result with success status and metadata
         """
         wait_time = 0
-        check_interval = 2  # seconds
+        # Most CUR lookups finish in ~1 s; a fixed 2 s poll more than doubled
+        # their wall time. Start fast, back off to 2 s for long queries.
+        check_interval = 0.25  # seconds
         
         while wait_time < self.query_timeout:
             try:
@@ -520,6 +522,7 @@ class CURCostProvider:
                 # Still running, wait and check again
                 time.sleep(check_interval)
                 wait_time += check_interval
+                check_interval = min(check_interval * 2, 2)
                 
             except Exception as e:
                 logger.error(f"Error checking query status {query_execution_id}: {e}")

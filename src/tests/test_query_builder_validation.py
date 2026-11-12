@@ -70,3 +70,10 @@ class TestCostBuilderServiceTypeValidation:
                 service_type=service_type,
                 months_back=1,
             )
+
+
+def test_s3_bucket_arn_without_account_accepted():
+    from lambda_handlers.cost.query_builder import _ARN_RE
+    assert _ARN_RE.fullmatch("arn:aws:s3:::amzn-s3-demo-bucket")
+    assert _ARN_RE.fullmatch("arn:aws:apigateway:us-east-1::/apis/m0gbvrez15/stages/production")
+    assert not _ARN_RE.fullmatch("arn:aws:s3:::bucket' OR '1'='1")

@@ -49,7 +49,7 @@ MSCK REPAIR TABLE tag_costs;
 
 Data collection runs automatically — no manual intervention required:
 
-- **Tag changes** → EventBridge CloudTrail rules detect changes in real time for the 45 services listed in `deployment/templates/event-forwarder-stack.yaml` (requires a CloudTrail trail; see DEPLOYMENT.md)
+- **Tag changes** → EventBridge rules detect changes in real time: the native `aws.tag` "Tag Change on Resource" event (all tagging services, including creation-time tags) plus CloudTrail tag API rules for the services listed in `deployment/templates/event-forwarder-stack.yaml` (CloudTrail rules require a trail; see DEPLOYMENT.md)
 - **Daily scan** → Coordinator runs daily; resumes from checkpoint if scan spans multiple days
 - **Fan-out mode** → Coordinator automatically switches to parallel invocation if scan age exceeds `MaxScanDays`
 - **Cost analysis** → Runs every 12 hours (if `EnableCostAnalysis=true`)
@@ -163,6 +163,7 @@ aws cloudformation update-stack \
       ParameterKey=Environment,UsePreviousValue=true \
       ParameterKey=HubRegion,UsePreviousValue=true \
       ParameterKey=OrganizationId,UsePreviousValue=true \
+      ParameterKey=AccessLogsBucketName,UsePreviousValue=true \
       ParameterKey=LambdaCodeBucket,UsePreviousValue=true \
       ParameterKey=EnableCostAnalysis,UsePreviousValue=true \
       ParameterKey=EnableRealTimeEvents,UsePreviousValue=true \
@@ -183,7 +184,6 @@ aws cloudformation wait stack-delete-complete --stack-name TagInsights --profile
 
 ```bash
 aws s3 rb s3://ti-central-analytics-REGION-prod-ACCOUNT --force --profile ${AWS_PROFILE}
-aws s3 rb s3://ti-access-logs-REGION-prod-ACCOUNT --force --profile ${AWS_PROFILE}
 ```
 
 For non-prod (`dev`/`test`/`cert`/`uat`/`staging`) — all buckets are automatically emptied and deleted.
@@ -289,4 +289,3 @@ If missing, create a new index and view scoped to the organization root.
 | Scan state              | `aggregator-state/*/latest.json.gz`     | Indefinite | Overwritten each scan              |
 | Scan checkpoints        | `aggregator-state/scan-checkpoint.json` | Per cycle  | Deleted on scan completion         |
 | Scan completion markers | `aggregator-state/completed/`           | Indefinite | Audit trail                        |
-| Access logs             | `ti-access-logs-*`                      | 1 year     | Transitions to S3-IA after 90 days |

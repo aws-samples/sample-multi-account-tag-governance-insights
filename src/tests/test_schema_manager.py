@@ -38,7 +38,7 @@ def _make_table_info(column_names, partition_keys=None, table_name="cur_table"):
             "Name": table_name,
             "StorageDescriptor": {
                 "Columns": columns,
-                "Location": "s3://bucket/cur/",
+                "Location": "s3://amzn-s3-demo-bucket/cur/",
                 "InputFormat": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat",
                 "OutputFormat": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat",
             },

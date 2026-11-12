@@ -36,7 +36,7 @@ Hub Account (your-hub-account-id)
 │
 ├── Worker Lambda  (ti-worker-ENV-ACCOUNT)  ← runs in hub account only
 │   ├── Discovers org-wide RE view ARN (ARN contains '/org/')
-│   ├── Queries RE Search with accountid:{account} region:{region} filter
+│   ├── Lists resources via RE ListResources (filter accountid:{account} region:{region})
 │   ├── Reads previous state from S3 (latest.json.gz)
 │   ├── Computes tag deltas (new/changed/removed)
 │   ├── Writes delta JSON to central analytics S3
@@ -86,7 +86,8 @@ Hub Account (your-hub-account-id)
 
 EventBridge StackSet → member accounts
     └── Event Forwarder Rules (per account × region)
-        └── Forwards CloudTrail tag change events → Hub Event Bus → SQS → Worker
+        └── Forwards native aws.tag "Tag Change on Resource" events and CloudTrail
+            tag API events → Hub Event Bus → SQS → Worker
 ```
 
 ---
@@ -104,8 +105,8 @@ EventBridge StackSet → member accounts
 
 2. Coordinator → Worker Lambda (hub account, synchronous invoke per pair)
    - Discovers org-wide RE view ARN (list_views, finds ARN with '/org/')
-   - Queries RE: resource-explorer-2:Search with ViewArn=org_view_arn,
-     QueryString="accountid:{account} region:{region}"
+   - Lists resources: resource-explorer-2:ListResources with ViewArn=org_view_arn,
+     Filters.FilterString="accountid:{account} region:{region}"
    - Loads previous state from S3 (latest.json.gz, gzip compressed)
    - Computes deltas: new_resource / tags_changed / resource_removed
    - Writes delta JSON to: deltas/account_id={X}/region={Y}/{ts}-{scan_id}.json
@@ -127,7 +128,8 @@ EventBridge StackSet → member accounts
    GROUP BY 1, 2, 3 ORDER BY count DESC;
 
 5. REAL-TIME PATH (parallel to scan path)
-   CloudTrail tag event → EventBridge rule (member account)
+   Native "Tag Change on Resource" event (source aws.tag, includes
+   creation-time tags) or CloudTrail tag API event → EventBridge rule (member account)
    → Hub Event Bus → SQS buffer → Worker Lambda
    → Same delta/state/SQS notification flow as scan path
 
@@ -208,12 +210,16 @@ def get_org_view_arn() -> Optional[str]:
 
 # Query scoped to specific account+region
 org_view_arn = get_org_view_arn()
-search_kwargs = {'QueryString': f"accountid:{account_id} region:{region}"}
+# ListResources, not Search: Search caps results at 1,000 per query even when paginated
+list_kwargs = {
+    'Filters': {'FilterString': f"accountid:{account_id} region:{region}"},
+    'MaxResults': 1000,
+}
 if org_view_arn:
-    search_kwargs['ViewArn'] = org_view_arn  # must explicitly pass org view
+    list_kwargs['ViewArn'] = org_view_arn  # must explicitly pass org view
 
-paginator = re_client.get_paginator('search')
-for page in paginator.paginate(**search_kwargs):
+paginator = re_client.get_paginator('list_resources')
+for page in paginator.paginate(**list_kwargs):
     for resource in page.get('Resources', []):
         arn = resource.get('Arn')
         tags = {}

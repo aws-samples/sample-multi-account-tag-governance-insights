@@ -325,7 +325,7 @@ Resources:
     UpdateReplacePolicy: !If [EnableAggressiveCleanup, Delete, Retain]
     Properties:
       QueueName: !Sub "${ProjectName}-forwarded-events-dlq-${Environment}"
-      SqsManagedSseEnabled: true
+      KmsMasterKeyId: alias/aws/sqs
       MessageRetentionPeriod: 1209600
       Tags:
         - Key: Application
@@ -340,7 +340,8 @@ Resources:
     UpdateReplacePolicy: !If [EnableAggressiveCleanup, Delete, Retain]
     Properties:
       QueueName: !Sub "${ProjectName}-forwarded-events-${Environment}"
-      SqsManagedSseEnabled: true
+      KmsMasterKeyId: !ImportValue
+        Fn::Sub: "ti-messaging-key-arn-${Environment}"
       VisibilityTimeout: 1800
       MessageRetentionPeriod: 86400
       ReceiveMessageWaitTimeSeconds: 20
@@ -391,6 +392,10 @@ Resources:
               - sqs:DeleteMessage
               - sqs:GetQueueAttributes
             Resource: !GetAtt ForwardedEventsQueue.Arn
+          - Effect: Allow
+            Action: kms:Decrypt
+            Resource: !ImportValue
+              Fn::Sub: "ti-messaging-key-arn-${Environment}"
 
   # ============================================================================
   # LAMBDA CODE SIGNING (PRODUCTION ONLY)
@@ -602,6 +607,7 @@ Resources:
       FunctionName: !Ref CoordinatorLambda
       Action: lambda:InvokeFunction
       Principal: events.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
       SourceArn: !GetAtt ScanScheduleRule.Arn
 
   # Real-time tag change forwarding rule (HubAggregatorWithEvents mode)
@@ -615,21 +621,28 @@ Resources:
       State: ENABLED
       EventBusName: !ImportValue
         Fn::Sub: "ti-hub-event-bus-name-${Environment}"
+      # Two shapes: CloudTrail tag APIs (carry caller identity) and the native
+      # "Tag Change on Resource" event (covers creation-time tags, full tag set).
       EventPattern:
-        detail-type:
-          - AWS API Call via CloudTrail
-        detail:
-          eventName:
-            - prefix: CreateTags
-            - prefix: DeleteTags
-            - prefix: TagResource
-            - prefix: UntagResource
-            - prefix: PutBucketTagging
-            - prefix: DeleteBucketTagging
-            - prefix: AddTags
-            - prefix: RemoveTags
-            - prefix: TagQueue
-            - prefix: UntagQueue
+        $or:
+          - detail-type:
+              - AWS API Call via CloudTrail
+            detail:
+              eventName:
+                - prefix: CreateTags
+                - prefix: DeleteTags
+                - prefix: TagResource
+                - prefix: UntagResource
+                - prefix: PutBucketTagging
+                - prefix: DeleteBucketTagging
+                - prefix: AddTags
+                - prefix: RemoveTags
+                - prefix: TagQueue
+                - prefix: UntagQueue
+          - source:
+              - aws.tag
+            detail-type:
+              - Tag Change on Resource
       Targets:
         - Arn: !GetAtt ForwardedEventsQueue.Arn
           Id: ForwardedEventsSQSTarget
@@ -922,6 +935,7 @@ Resources:
       FunctionName: !Ref MonthlyAggregatorLambda
       Action: lambda:InvokeFunction
       Principal: events.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
       SourceArn: !GetAtt MonthlyAggregationScheduleRule.Arn
 
   MonthlyAggregatorErrorAlarm:

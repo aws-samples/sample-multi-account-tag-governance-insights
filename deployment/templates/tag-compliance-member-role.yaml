@@ -1,0 +1,53 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  TagInsights - Tag Compliance member role. Deploy to every account in the organization
+  (service-managed StackSet; also deploy as a plain stack in the management account if the
+  rule evaluates it). Lets the hub tag-compliance rule Lambda write evaluations into this account.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: ti
+
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, test, cert, uat, staging, prod]
+
+  HubAccountId:
+    Type: String
+    AllowedPattern: "^[0-9]{12}$"
+    Description: Account that runs tag-compliance-stack.yaml
+
+Resources:
+  EvaluationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-tag-compliance-eval-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${HubAccountId}:root"
+            Action: sts:AssumeRole
+            Condition:
+              ArnLike:
+                # One rule Lambda role per hub Region
+                aws:PrincipalArn: !Sub "arn:${AWS::Partition}:iam::${HubAccountId}:role/${ProjectName}-tag-compliance-rule-*-${Environment}"
+      Policies:
+        - PolicyName: TagComplianceEvaluation
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Neither action supports resource-level permissions.
+              - Effect: Allow
+                Action:
+                  - config:PutEvaluations
+                  - config:GetResourceConfigHistory
+                Resource: "*"
+      Tags:
+        - Key: Application
+          Value: TagInsights
+        - Key: Environment
+          Value: !Ref Environment

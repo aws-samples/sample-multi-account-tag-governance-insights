@@ -24,7 +24,7 @@ sequenceDiagram
     CO->>CO: Discover all org accounts × hub regions
     CO->>WK: Invoke Worker per account+region pair
 
-    WK->>RE: Search resources (accountid:{id} region:{region})
+    WK->>RE: ListResources (filter accountid:{id} region:{region})
     RE-->>WK: Resources + inline tags (org-wide view)
     WK->>S3: Read previous state (latest.json.gz)
     WK->>WK: Compute delta
@@ -192,7 +192,7 @@ aws lambda invoke \
 **What it does:**
 
 1. Locates the org-wide Resource Explorer view (ARN contains `/org/`)
-2. Queries Resource Explorer via boto3 — `resource-explorer-2:Search` with `accountid:{account} region:{region}` filter
+2. Lists every resource in the account+Region with Resource Explorer `ListResources` (filter `accountid:{account} region:{region}`; Search would cap at 1,000 results)
 3. Extracts tags inline from RE response `Properties[name=tags].Data` — no secondary API calls
 4. Reads previous state from `aggregator-state/account_id={account}/region={region}/latest.json.gz`
 5. Computes delta (new resources, changed tags, removed resources)

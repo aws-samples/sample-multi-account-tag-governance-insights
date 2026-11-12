@@ -93,6 +93,30 @@ Resources:
           RoleArn: !GetAtt EventForwarderRole.Arn
 
   # ============================================================================
+  # NATIVE TAG CHANGE FORWARDING RULE
+  # "Tag Change on Resource" (source aws.tag) fires for every tagging service,
+  # including tags set at resource creation, which emit no CloudTrail tag API
+  # event. Best-effort delivery and no caller identity, so the CloudTrail rules
+  # above stay in place for "who changed it".
+  # ============================================================================
+
+  TagChangeForwardingRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ProjectName}-forward-tag-change-${AWS::Region}-${Environment}"
+      Description: "Forward native Tag Change on Resource events to TagInsights hub event bus"
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.tag
+        detail-type:
+          - Tag Change on Resource
+      Targets:
+        - Arn: !Sub "arn:aws:events:${HubRegion}:${HubAccountId}:event-bus/${ProjectName}-hub-${Environment}"
+          Id: HubEventBusTagChangeTarget
+          RoleArn: !GetAtt EventForwarderRole.Arn
+
+  # ============================================================================
   # EXTENDED EVENTBRIDGE FORWARDING RULE (optional — 40+ additional services)
   # ============================================================================
 

@@ -16,8 +16,8 @@ TagInsights follows least-privilege IAM. Each Lambda has its own dedicated role 
 
 | Role                           | Permissions                                                                                                                                                                                                          |
 |--------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `ti-orches-REGION-ENV`         | `organizations:ListAccounts`, `organizations:DescribeOrganization`, `resource-explorer-2:ListIndexes/Search`, S3 read/write to central analytics bucket (aggregator-state prefix), `lambda:InvokeFunction` on Worker |
-| `ti-worker-REGION-ENV`         | `resource-explorer-2:Search/ListIndexes/ListViews`, S3 read/write to central analytics bucket, SQS send to central results queue                                                                                     |
+| `ti-orches-REGION-ENV`         | `organizations:ListAccounts`, `organizations:DescribeOrganization`, `resource-explorer-2:ListIndexes`, S3 read/write to central analytics bucket (aggregator-state prefix), `lambda:InvokeFunction` on Worker |
+| `ti-worker-REGION-ENV`         | `resource-explorer-2:ListResources/Search/ListIndexes/ListViews`, S3 read/write to central analytics bucket, SQS send to central results queue                                                                                     |
 | `ti-analytics-REGION-ENV`      | S3 read/write to central analytics bucket, SQS receive/delete from central results queue, Glue partition management                                                                                                  |
 | `ti-monthly-agg-REGION-ENV`    | S3 read/write/delete central analytics bucket, Athena query execution, Glue table/partition management                                                                                                               |
 | `ti-bucket-emptier-REGION-ENV` | S3 list/delete objects on `ti-*-REGION-ENV-ACCOUNT` buckets (non-prod only)                                                                                                                                          |
@@ -80,7 +80,7 @@ RestrictPublicBuckets: true
 
 ### S3 Server Access Logging
 
-All S3 buckets have server access logging enabled to a dedicated `taginsights-access-logs-*` bucket.
+All S3 buckets have server access logging enabled to your existing access-log bucket (`AccessLogsBucketName`), normally provided by your logging baseline (AWS Control Tower or Landing Zone Accelerator). The stack does not create a log bucket.
 Logs are retained for 1 year.
 
 ### S3 Versioning
@@ -164,8 +164,8 @@ The Worker Lambda implements a per-account in-memory sliding window rate limiter
 Production Lambda deployments enforce cryptographic code signing via AWS Signer (ECDSA-SHA384):
 
 - `UntrustedArtifactOnDeployment: Enforce` — unsigned or tampered packages are rejected by CloudFormation on prod
-- Applied to all 7 packaged Lambda functions across both CFN stacks that deploy them (`aggregator-stack`,
-  `cost-analysis-stack`)
+- Applied to all 9 Lambda functions across all 3 CFN stacks that deploy Lambda code (`aggregator-stack`,
+  `cost-analysis-stack`, `tag-compliance-stack`)
 - Dev/test/staging environments skip signing for deployment velocity
 - One-time setup:
   `aws signer put-signing-profile --profile-name taginsights-lambda-signer --platform-id AWSLambda-SHA384-ECDSA`

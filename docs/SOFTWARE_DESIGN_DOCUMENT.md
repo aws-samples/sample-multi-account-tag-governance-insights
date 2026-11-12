@@ -9,7 +9,7 @@
 
 TagInsights provides AWS resource tagging governance at scale. It collects tag data from all resources across all
 accounts and regions in an AWS Organization, stores it as queryable analytics data, and enables cost attribution and
-tagging gap analysis.
+tag compliance reporting.
 
 ---
 
@@ -83,12 +83,13 @@ Manages the full scan lifecycle across all accounts and regions. Runs daily in t
 
 **File:** `src/lambda_handlers/aggregator_worker.py`
 
-The primary data collection component. Invoked by Coordinator (scan path) or EventBridge CloudTrail rules (real-time
+The primary data collection component. Invoked by Coordinator (scan path) or forwarded EventBridge tag events (real-time
 path).
 
 **Algorithm (scan path):**
 
-1. Call `resource-explorer-2:Search` directly via boto3 with `accountid:{account} region:{region}` query
+1. Call `resource-explorer-2:ListResources` directly via boto3 with filter `accountid:{account} region:{region}`
+   (not `Search`, which caps results at 1,000 per query)
 2. Extract tags inline from `Properties[name=tags].Data` — no secondary per-resource API calls
 3. Load previous state from `aggregator-state/account_id={account}/region={region}/latest.json.gz` (empty dict on first
    scan)
@@ -98,8 +99,9 @@ path).
 7. **Rate-limit SQS notifications** — per-account sliding window (20 msgs/min); rate-limited deltas stay in S3
 
 **Algorithm (real-time path):**
-EventBridge CloudTrail rule detects tag operations (TagResource, CreateTags, etc.); Worker extracts ARNs from the event
-payload, updates only the affected resources in state.
+EventBridge rules match the native `aws.tag` "Tag Change on Resource" event (covers every tagging service, including
+tags set at creation, with the full tag set) and CloudTrail tag API events (TagResource, CreateTags, etc., which carry
+the caller identity); Worker extracts ARNs from the event payload, updates only the affected resources in state.
 
 **Key environment variables:**
 
@@ -168,6 +170,8 @@ Matches AWS resource ARNs directly against CUR (Cost & Usage Report) line items 
 
 **Prerequisite:** CUR must be enabled in AWS Billing with resource IDs and Athena integration.
 
+---
+
 ## 4. Data Model
 
 ### 4.1 Tag Delta Record (resource_tag_deltas_recent)
@@ -233,7 +237,9 @@ One row per tag on each costed resource; resource-level cost columns repeat on e
 | `deployment/aggregator-stack.yaml`                | Coordinator + Worker + Analytics Writer + Monthly Aggregator Lambdas        |
 | `deployment/cost-analysis-stack.yaml`             | Optional: Cost Coordinator + Worker + Deduplicator + FIFO SQS + SNS trigger |
 | `deployment/deploy.yaml`                          | Root deployment orchestration                                               |
-| `deployment/templates/event-forwarder-stack.yaml` | StackSet template for member account CloudTrail event forwarding            |
+| `deployment/templates/event-forwarder-stack.yaml` | StackSet template for member account tag-change event forwarding (native `aws.tag` + CloudTrail) |
+| `deployment/tag-compliance-stack.yaml`            | Optional, deployed separately in the AWS Config delegated administrator account: tag compliance Config rule + daily SES report |
+| `deployment/templates/tag-compliance-member-role.yaml` | StackSet template for the per-account Config evaluation role used by the tag compliance rule |
 
 ### 5.2 Key Parameters
 
@@ -260,6 +266,8 @@ src/
 │   ├── aggregator_worker.py         # RE direct query + delta computation (SQS rate limiting M5)
 │   ├── analytics_writer_handler.py  # SQS → Parquet writer + input validation
 │   ├── monthly_aggregator_handler.py
+│   ├── tag_compliance_rule.py       # AWS Config custom rule evaluator
+│   ├── tag_compliance_report.py     # Daily compliance report via Amazon SES
 │   └── cost/
 │       ├── allocation_manager.py    # Cost allocation tag management + CE fallback
 │       ├── cur_direct_matcher.py    # ARN → CUR line_item_resource_id normalization
@@ -288,11 +296,13 @@ deployment/
 ├── core-stack.yaml
 ├── aggregator-stack.yaml
 ├── cost-analysis-stack.yaml
-├── deploy.yaml
+├── deploy.yaml                      # Root stack: nests core, aggregator, cost-analysis
+├── tag-compliance-stack.yaml        # Deployed separately (AWS Config delegated administrator)
 ├── package_lambdas.py               # Builds + signs Lambda ZIPs (AWS Signer for prod)
 ├── requirements-lambda.txt
 ├── templates/
-│   └── event-forwarder-stack.yaml   # StackSet for member account event forwarding
+│   ├── event-forwarder-stack.yaml   # StackSet for member account event forwarding
+│   └── tag-compliance-member-role.yaml  # StackSet: Config evaluation role in every account
 └── scripts/
     ├── cleanup-orphaned-resources.sh
     └── collect-resource-counts.py

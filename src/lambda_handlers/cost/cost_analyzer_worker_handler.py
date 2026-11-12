@@ -19,6 +19,7 @@ Features:
 - DLQ for failed messages
 """
 
+import calendar
 import os
 import json
 import calendar
@@ -377,16 +378,28 @@ class CostAnalyzerWorker:
         Returns:
             Dict: Normalized tag row
         """
-        # The matcher sums the current month's CUR partition (MONTHS_BACK=1),
-        # so "monthly_cost" is month-to-date.
-        # ponytail: last_month_cost stays 0; add a previous-month CUR query to fill it.
-        current_month_mtd = cost_data.get('monthly_cost', 0.0) if cost_data else 0.0
-
+        window_cost = (cost_data or {}).get('monthly_cost', 0.0) or 0.0
+        last_month_cost = 0.0
+        current_month_mtd = 0.0
+        current_month_projected = 0.0
+        avg_daily_cost = 0.0
         today = date.today()
-        days_in_month = calendar.monthrange(today.year, today.month)[1]
-        avg_daily_cost = current_month_mtd / today.day
-        current_month_projected = avg_daily_cost * days_in_month
 
+        if self.months_back == 1:
+            # The CUR window with MONTHS_BACK=1 is the CURRENT month only, so the
+            # matched cost is month-to-date, not last month's cost.
+            # Limitation: last_month_cost stays 0; filling it needs a second CUR
+            # query per batch, and batches already run close to the timeout.
+            days_in_month = calendar.monthrange(today.year, today.month)[1]
+            current_month_mtd = window_cost
+            avg_daily_cost = window_cost / today.day
+            current_month_projected = avg_daily_cost * days_in_month
+        elif window_cost > 0:
+            # Multi-month window: legacy approximation over the whole window.
+            last_month_cost = window_cost
+            current_month_projected = window_cost
+            avg_daily_cost = window_cost / (30.0 * self.months_back)
+        
         # Create normalized row
         row = {
             'tag_key': tag_key,
@@ -395,7 +408,7 @@ class CostAnalyzerWorker:
             'resource_arn': resource.get('resource_arn'),
             'resource_type': resource.get('resource_type'),
             'region': resource.get('region'),
-            'last_month_cost': 0.0,
+            'last_month_cost': last_month_cost,
             'current_month_mtd': current_month_mtd,
             'current_month_projected': current_month_projected,
             'avg_daily_cost': avg_daily_cost,
