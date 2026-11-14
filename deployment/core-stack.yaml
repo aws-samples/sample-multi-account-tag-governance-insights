@@ -68,19 +68,57 @@ Resources:
       VersioningConfiguration:
         Status: Enabled
       LifecycleConfiguration:
+        # Rules are scoped per prefix: S3 applies the shortest matching
+        # expiration, so a bucket-wide 1-day noncurrent rule would override
+        # the 7-day aggregator-state rule below.
         Rules:
+          # Safety net only. The monthly aggregator compacts each calendar
+          # month once it ended >= 28 days before the run (data 30-63 days
+          # old on day 2) and then deletes those daily partitions; 130 days
+          # leaves room for a few missed monthly runs before data is lost.
+          # Pinned by test_recent_lifecycle_outlives_compaction_with_a_missed_run.
           - Id: DeleteOldRecent
             Status: Enabled
             Prefix: tag-deltas/recent/
-            ExpirationInDays: 95
+            ExpirationInDays: 130
+            NoncurrentVersionExpirationInDays: 1
           - Id: TransitionHistoricalToIA
             Status: Enabled
             Prefix: tag-deltas/historical/
             Transitions:
               - TransitionInDays: 90
                 StorageClass: STANDARD_IA
-          - Id: DeleteOldVersions
+            NoncurrentVersionExpirationInDays: 1
+          - Id: DeleteTagCostAllocationOldVersions
             Status: Enabled
+            Prefix: tag-cost-allocation/
+            NoncurrentVersionExpirationInDays: 1
+          # Cost Allocator UNLOAD staging: written and deleted on every run, so
+          # only noncurrent versions and delete markers are left behind.
+          - Id: DeleteTagCostAllocationStaging
+            Status: Enabled
+            Prefix: tag-cost-allocation-staging/
+            NoncurrentVersionExpirationInDays: 1
+            ExpiredObjectDeleteMarker: true
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+          # Raw Worker delta JSON is only staging for the Analytics Writer
+          # (results queue + DLQ retain messages 14 days each).
+          - Id: DeleteRawDeltas
+            Status: Enabled
+            Prefix: deltas/
+            ExpirationInDays: 35
+            NoncurrentVersionExpirationInDays: 1
+          - Id: DeleteQuarantine
+            Status: Enabled
+            Prefix: quarantine/
+            ExpirationInDays: 30
+            NoncurrentVersionExpirationInDays: 1
+          # Who-called-the-tag-API records (CloudTrail); kept about 13 months.
+          - Id: DeleteOldTagChangeEvents
+            Status: Enabled
+            Prefix: tag-change-events/
+            ExpirationInDays: 400
             NoncurrentVersionExpirationInDays: 1
           - Id: DeleteAggregatorStateOldVersions
             Status: Enabled
@@ -198,7 +236,7 @@ Resources:
               StringEquals:
                 aws:SourceAccount: !Ref AWS::AccountId
       ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
       Policies:
         - PolicyName: BucketEmptierPolicy
           PolicyDocument:
@@ -212,8 +250,12 @@ Resources:
                   - s3:DeleteObjectVersion
                   - s3:GetBucketVersioning
                 Resource:
-                  - !Sub "arn:aws:s3:::ti-*-${AWS::Region}-${Environment}-${AWS::AccountId}"
-                  - !Sub "arn:aws:s3:::ti-*-${AWS::Region}-${Environment}-${AWS::AccountId}/*"
+                  - !Sub "arn:${AWS::Partition}:s3:::ti-*-${AWS::Region}-${Environment}-${AWS::AccountId}"
+                  - !Sub "arn:${AWS::Partition}:s3:::ti-*-${AWS::Region}-${Environment}-${AWS::AccountId}/*"
+              # Tells a stack delete from an update that only removes the emptier
+              - Effect: Allow
+                Action: cloudformation:DescribeStacks
+                Resource: !Ref AWS::StackId
 
   BucketEmptierFunction:
     Type: AWS::Lambda::Function
@@ -222,7 +264,7 @@ Resources:
     UpdateReplacePolicy: Delete
     Properties:
       FunctionName: !Sub "ti-bucket-emptier-${Environment}-${AWS::AccountId}"
-      Runtime: python3.11
+      Runtime: python3.14
       Handler: index.handler
       Role: !GetAtt BucketEmptierRole.Arn
       Timeout: 300
@@ -230,42 +272,44 @@ Resources:
         ZipFile: |
           import boto3
           import cfnresponse
-          def empty_bucket(bucket_name):
+          # Stop and report FAILED with this much time left, so CloudFormation
+          # never waits an hour for a response from a timed-out function.
+          SAFETY_MS = 30000
+          def delete_batch(s3, bucket_name, objects):
+              errors = s3.delete_objects(Bucket=bucket_name, Delete={'Objects': objects}).get('Errors', [])
+              if errors:
+                  raise RuntimeError(f"{len(errors)} objects not deleted, e.g. {errors[0]}")
+          def empty_bucket(bucket_name, context):
               s3 = boto3.client('s3')
               try:
-                  versioning = s3.get_bucket_versioning(Bucket=bucket_name)
-                  versioned = versioning.get('Status') in ('Enabled', 'Suspended')
-                  if versioned:
-                      paginator = s3.get_paginator('list_object_versions')
-                      for page in paginator.paginate(Bucket=bucket_name):
-                          objects = []
-                          for v in page.get('Versions', []):
-                              objects.append({'Key': v['Key'], 'VersionId': v['VersionId']})
-                          for m in page.get('DeleteMarkers', []):
-                              objects.append({'Key': m['Key'], 'VersionId': m['VersionId']})
-                          if objects:
-                              s3.delete_objects(Bucket=bucket_name, Delete={'Objects': objects})
-                  else:
-                      paginator = s3.get_paginator('list_objects_v2')
-                      for page in paginator.paginate(Bucket=bucket_name):
-                          objects = [{'Key': o['Key']} for o in page.get('Contents', [])]
-                          if objects:
-                              s3.delete_objects(Bucket=bucket_name, Delete={'Objects': objects})
+                  # Listing versions also covers unversioned buckets (VersionId 'null').
+                  for page in s3.get_paginator('list_object_versions').paginate(Bucket=bucket_name):
+                      if context.get_remaining_time_in_millis() < SAFETY_MS:
+                          raise TimeoutError(f"Ran out of time emptying {bucket_name}; empty it manually and retry")
+                      objects = [{'Key': v['Key'], 'VersionId': v['VersionId']}
+                                 for v in page.get('Versions', []) + page.get('DeleteMarkers', [])]
+                      if objects:
+                          delete_batch(s3, bucket_name, objects)
                   print(f"Emptied bucket: {bucket_name}")
               except s3.exceptions.NoSuchBucket:
                   print(f"Bucket {bucket_name} does not exist, skipping")
-              except Exception as e:
-                  print(f"Error emptying {bucket_name}: {e}")
-                  raise
+          def stack_deleting(stack_id):
+              # A Delete also arrives when an update drops this resource (e.g.
+              # ForceDeleteOnStackRemoval true -> false); empty only on a stack delete.
+              stack = boto3.client('cloudformation').describe_stacks(StackName=stack_id)['Stacks'][0]
+              return stack['StackStatus'] in ('DELETE_IN_PROGRESS', 'ROLLBACK_IN_PROGRESS')
           def handler(event, context):
+              bucket = event.get('ResourceProperties', {}).get('BucketName', 'unknown')
               try:
-                  bucket = event['ResourceProperties']['BucketName']
                   if event['RequestType'] == 'Delete':
-                      empty_bucket(bucket)
-                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      if stack_deleting(event['StackId']):
+                          empty_bucket(bucket, context)
+                      else:
+                          print(f"Stack not being deleted; keeping {bucket} contents")
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, physicalResourceId=bucket)
               except Exception as e:
                   print(f"BucketEmptier failed: {e}")
-                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)}, physicalResourceId=bucket)
 
   CentralAnalyticsBucketEmptier:
     Type: Custom::BucketEmptier
@@ -338,6 +382,11 @@ Resources:
               Type: string
             - Name: scan_id
               Type: string
+            # Appended last so older Parquet files (without them) still read
+            - Name: changed_by
+              Type: string
+            - Name: event_name
+              Type: string
         PartitionKeys:
           - Name: account_id
             Type: string
@@ -390,60 +439,12 @@ Resources:
               Type: string
             - Name: region
               Type: string
-        PartitionKeys:
-          - Name: account_id
-            Type: string
-          - Name: year
-            Type: int
-          - Name: month
-            Type: int
-
-  TagCostsTable:
-    Type: AWS::Glue::Table
-    DependsOn: [GlueDatabase, CentralAnalyticsBucket]
-    Properties:
-      CatalogId: !Ref AWS::AccountId
-      DatabaseName: !Ref GlueDatabase
-      TableInput:
-        Name: tag_costs
-        Description: "Tag-based cost allocation analysis partitioned by account/month"
-        TableType: EXTERNAL_TABLE
-        Parameters:
-          classification: parquet
-          "parquet.compression": SNAPPY
-        StorageDescriptor:
-          Location: !Sub "s3://${CentralAnalyticsBucket}/tag-costs/"
-          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
-          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
-          SerdeInfo:
-            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
-            Parameters:
-              serialization.format: "1"
-          Columns:
-            - Name: tag_key
+            # Appended last so older Parquet files (without them) still read.
+            # Written by the monthly aggregator.
+            - Name: changed_by
               Type: string
-            - Name: tag_value
+            - Name: event_name
               Type: string
-            - Name: is_cost_allocation_tag
-              Type: boolean
-            - Name: resource_arn
-              Type: string
-            - Name: resource_type
-              Type: string
-            - Name: region
-              Type: string
-            - Name: last_month_cost
-              Type: double
-            - Name: current_month_mtd
-              Type: double
-            - Name: current_month_projected
-              Type: double
-            - Name: avg_daily_cost
-              Type: double
-            - Name: analysis_date
-              Type: date
-            - Name: last_updated
-              Type: timestamp
         PartitionKeys:
           - Name: account_id
             Type: string
@@ -455,6 +456,68 @@ Resources:
   # ============================================================================
   # ATHENA WORKGROUP
   # ============================================================================
+
+  # Caller identity for tag API calls (CloudTrail). The delta tables stay change-only;
+  # join on arn and time to see who made a change. Partition projection: no partitions to manage.
+  TagChangeEventsTable:
+    Type: AWS::Glue::Table
+    DependsOn: [GlueDatabase, CentralAnalyticsBucket]
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: tag_change_events
+        Description: "Who called a tag API (from CloudTrail), one row per resource per call"
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: json
+          projection.enabled: "true"
+          projection.year.type: integer
+          projection.year.range: "2020,2100"
+          projection.month.type: integer
+          projection.month.range: "1,12"
+          projection.day.type: integer
+          projection.day.range: "1,31"
+          storage.location.template: !Sub "s3://${CentralAnalyticsBucket}/tag-change-events/year=${!year}/month=${!month}/day=${!day}/"
+        PartitionKeys:
+          - Name: year
+            Type: int
+          - Name: month
+            Type: int
+          - Name: day
+            Type: int
+        StorageDescriptor:
+          Location: !Sub "s3://${CentralAnalyticsBucket}/tag-change-events/"
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+            # Tag keys are case-sensitive; the SerDe lower-cases map keys by default.
+            Parameters:
+              case.insensitive: "false"
+          Columns:
+            - Name: event_time
+              Type: bigint
+              Comment: CloudTrail eventTime, epoch seconds
+            - Name: event_id
+              Type: string
+            - Name: event_name
+              Type: string
+            - Name: account_id
+              Type: string
+            - Name: region
+              Type: string
+            - Name: arn
+              Type: string
+            - Name: changed_by
+              Type: string
+              Comment: CloudTrail userIdentity ARN (or principalId)
+            - Name: principal_type
+              Type: string
+            - Name: tags_set
+              Type: map<string,string>
+            - Name: tags_removed
+              Type: array<string>
 
   AthenaWorkgroup:
     Type: AWS::Athena::WorkGroup
@@ -603,7 +666,7 @@ Resources:
           - Sid: AllowSameAccountCrossRegion
             Effect: Allow
             Principal:
-              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
             Action: sqs:SendMessage
             Resource: !GetAtt CentralResultQueue.Arn
 

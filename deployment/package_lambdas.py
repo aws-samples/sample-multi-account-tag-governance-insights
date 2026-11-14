@@ -45,7 +45,6 @@ class LambdaPackager:
         self.project_root = Path(project_root or os.path.dirname(os.path.dirname(__file__)))
         self.deployment_dir = self.project_root / 'deployment'
         self.lambda_handlers_dir = self.project_root / 'src' / 'lambda_handlers'
-        self.src_dir = self.project_root / 'src'
         self.build_dir = self.deployment_dir / 'lambda_builds'
         
         # Ensure build directory exists
@@ -73,26 +72,18 @@ class LambdaPackager:
                 'handler_file': 'analytics_writer_handler.py',
                 'handler_name': 'lambda_handler',
                 'description': 'Analytics Writer for converting regional JSON deltas to central S3 Parquet',
+                # zip path -> project-relative source; read next to the handler module
+                'data_files': {'schemas/delta_schema.json': 'src/schemas/delta_schema.json'},
             },
             'monthly_aggregator': {
                 'handler_file': 'monthly_aggregator_handler.py',
                 'handler_name': 'lambda_handler',
-                'description': 'Monthly Aggregator for consolidating 90-day-old data into monthly summaries'
+                'description': 'Monthly Aggregator compacting the month that ended at least 28 days ago into monthly rows'
             },
-            'cost_analyzer_coordinator': {
-                'handler_file': 'cost/cost_analyzer_coordinator_handler.py',
+            'cost_allocator': {
+                'handler_file': 'cost/cost_allocator_handler.py',
                 'handler_name': 'lambda_handler',
-                'description': 'Cost Analyzer Coordinator for querying changed resources and queueing cost analysis work'
-            },
-            'cost_analyzer_worker': {
-                'handler_file': 'cost/cost_analyzer_worker_handler.py',
-                'handler_name': 'lambda_handler',
-                'description': 'Cost Analyzer Worker for processing resource batches and writing normalized tag costs'
-            },
-            'cost_deduplicator': {
-                'handler_file': 'cost/cost_deduplicator_handler.py',
-                'handler_name': 'lambda_handler',
-                'description': 'Cost Deduplicator for consolidating daily partitions into monthly archives'
+                'description': 'Cost Allocator for set-based monthly tag cost allocation via Athena UNLOAD'
             },
             'tag_compliance_rule': {
                 'handler_file': 'tag_compliance_rule.py',
@@ -142,6 +133,7 @@ class LambdaPackager:
                     handler_file=func_config['handler_file'],
                     description=func_config['description'],
                     include_dirs=func_config.get('include_dirs'),
+                    data_files=func_config.get('data_files'),
                 )
                 package_paths[func_name] = package_path
                 print(f"✓ {func_name} packaged: {package_path}")
@@ -162,7 +154,8 @@ class LambdaPackager:
                                function_name: str,
                                handler_file: str,
                                description: str = "",
-                               include_dirs: Optional[List[str]] = None) -> str:
+                               include_dirs: Optional[List[str]] = None,
+                               data_files: Optional[Dict[str, str]] = None) -> str:
         """
         Package a single Lambda function.
         
@@ -184,8 +177,8 @@ class LambdaPackager:
 
                 # Create package structure
                 print(f"  Building package structure...")
-                self._copy_source_code(temp_path)
                 self._copy_handler_code(temp_path, handler_file, include_dirs)
+                self._copy_data_files(temp_path, data_files)
                 self._install_dependencies(temp_path)
                 self._remove_generated_bytecode(temp_path)
                 self._create_index_file(temp_path, handler_file)
@@ -204,19 +197,20 @@ class LambdaPackager:
         
         return str(package_path)
     
-    def _copy_source_code(self, temp_path: Path):
-        """Copy TagInsights source code to package directory."""
-        print(f"    Copying source code...")
-        
-        # Copy the entire src directory
-        src_dest = temp_path / 'src'
-        shutil.copytree(self.src_dir, src_dest, ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
-        
-        # Copy requirements.txt for reference
-        requirements_src = self.project_root / 'requirements.txt'
-        if requirements_src.exists():
-            shutil.copy2(requirements_src, temp_path / 'requirements.txt')
-    
+    def _copy_data_files(self, temp_path: Path, data_files: Optional[Dict[str, str]] = None):
+        """Copy non-code runtime files (zip path -> project-relative source).
+
+        Only the handler, its package, and these files ship; src/tests, src/utils
+        and other source trees are not imported at runtime.
+        """
+        for zip_path, source in (data_files or {}).items():
+            source_path = self.project_root / source
+            if not source_path.is_file():
+                raise FileNotFoundError(f"Required data file not found: {source_path}")
+            destination = temp_path / zip_path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_path, destination)
+
     def _copy_handler_code(
         self,
         temp_path: Path,
@@ -273,9 +267,10 @@ class LambdaPackager:
                 '-r', str(requirements_file),
                 '-t', str(temp_path),
                 '--platform', 'manylinux2014_x86_64',
-                '--python-version', '3.11',
+                '--python-version', '3.14',
                 '--implementation', 'cp',
-                '--abi', 'cp311',
+                # Matches the python3.14 runtime; pip also accepts abi3 and pure (none) wheels for it.
+                '--abi', 'cp314',
                 '--only-binary', ':all:',
                 '--no-compile',
                 '--quiet'
@@ -333,7 +328,14 @@ if __name__ == "__main__":
                 if file_path.is_file():
                     # Calculate relative path from temp_path
                     relative_path = file_path.relative_to(temp_path)
-                    zipf.write(file_path, relative_path)
+                    info = zipfile.ZipInfo.from_file(file_path, relative_path)
+                    info.compress_type = zipfile.ZIP_DEFLATED
+                    # Lambda runs code as another user, so entries must be world-readable
+                    # whatever the build host's umask (077/027 would pack 0600/0640).
+                    mode = 0o755 if file_path.stat().st_mode & 0o111 else 0o644
+                    info.external_attr = (0o100000 | mode) << 16
+                    with file_path.open('rb') as source, zipf.open(info, 'w') as target:
+                        shutil.copyfileobj(source, target)
     
     def _validate_package(self, package_path: Path) -> Dict:
         """Validate the created package."""
@@ -410,7 +412,9 @@ if __name__ == "__main__":
         s3_client = boto3.client('s3')
         
         s3_urls = {}
-        
+        # function_name -> S3 VersionId of the versioned key (AWS Signer signs an exact version)
+        self.uploaded_version_ids = {}
+
         for func_name, local_path in package_paths.items():
             try:
                 package_path = Path(local_path)
@@ -436,11 +440,12 @@ if __name__ == "__main__":
                     versioned_key = f"lambda-packages/v{deployment_version}/{func_name}.zip"
                     print(f"Uploading {func_name} (versioned: v{deployment_version})...")
                     with package_path.open('rb') as package_file:
-                        s3_client.put_object(
+                        response = s3_client.put_object(
                             **put_args,
                             Body=package_file,
                             Key=versioned_key,
                         )
+                    self.uploaded_version_ids[func_name] = response.get('VersionId')
                     print(f"✓ {func_name} uploaded: {versioned_key}")
                     s3_url = f"https://{bucket_name}.s3.amazonaws.com/{versioned_key}"
                 
@@ -548,14 +553,17 @@ def sign_lambda_packages(
     package_paths: Dict[str, str],
     bucket_name: str,
     deployment_version: str,
+    source_version_ids: Dict[str, str],
     signing_profile_name: str = 'taginsights-lambda-signer'
 ) -> Dict[str, str]:
     """
-    Sign Lambda packages using AWS Signer for production deployments.
-    
-    Code signing: only signed packages
-    can be deployed to prod environments (CodeSigningConfigArn: Enforce).
-    
+    Sign Lambda packages using AWS Signer (--sign).
+
+    Stacks deployed with EnableCodeSigning=true only accept signed packages
+    (CodeSigningConfigArn: Enforce) and read them from signed/v<version>/.
+    AWS Signer requires the exact S3 object version, so the artifact bucket
+    must have versioning enabled.
+
     Prerequisites (one-time setup per region):
         aws signer put-signing-profile \\
             --profile-name taginsights-lambda-signer \\
@@ -566,6 +574,7 @@ def sign_lambda_packages(
         package_paths: Dict of function_name -> local .zip path
         bucket_name: S3 bucket where unsigned packages were uploaded
         deployment_version: Immutable version shared by unsigned and signed keys
+        source_version_ids: Dict of function_name -> S3 VersionId of the unsigned upload
         signing_profile_name: AWS Signer profile name (default: taginsights-lambda-signer)
         
     Returns:
@@ -575,7 +584,19 @@ def sign_lambda_packages(
     import time
     
     print(f"\n=== Signing Lambda packages with AWS Signer (profile: {signing_profile_name}) ===")
-    
+
+    unversioned = [
+        name for name in package_paths
+        if not isinstance(source_version_ids.get(name), str) or source_version_ids.get(name) in ('', 'null')
+    ]
+    if unversioned:
+        raise ValueError(
+            f"S3 bucket {bucket_name} returned no object VersionId for {', '.join(unversioned)}. "
+            f"AWS Signer needs a versioned source object: enable versioning on the bucket "
+            f"(aws s3api put-bucket-versioning --bucket {bucket_name} "
+            f"--versioning-configuration Status=Enabled) and upload with a new --version."
+        )
+
     signer = boto3.client('signer')
     s3 = boto3.client('s3')
     signed_keys = {}
@@ -594,7 +615,7 @@ def sign_lambda_packages(
                     's3': {
                         'bucketName': bucket_name,
                         'key': unsigned_key,
-                        'version': 'null'  # latest version
+                        'version': source_version_ids[func_name],
                     }
                 },
                 destination={
@@ -669,11 +690,12 @@ def main():
     parser.add_argument('--upload-bucket', help='S3 bucket for uploading packages')
     parser.add_argument('--environment', default='dev',
                         choices=['dev', 'test', 'cert', 'uat', 'staging', 'prod'],
-                        help='Deployment environment (prod enables code signing)')
+                        help='Deployment environment (informational; does not enable signing)')
+    parser.add_argument('--sign', action='store_true',
+                        help='Sign uploaded packages with AWS Signer into signed/v<version>/ '
+                             '(for stacks deployed with EnableCodeSigning=true; needs a versioned bucket)')
     parser.add_argument('--signing-profile', default='taginsights-lambda-signer',
                         help='AWS Signer profile name (default: taginsights-lambda-signer)')
-    parser.add_argument('--worker-only', action='store_true',
-                        help='Package only cost_analyzer_worker')
     parser.add_argument('--version',
                         help='Explicit immutable deployment version')
     parser.add_argument('--versioned-only', action='store_true',
@@ -686,7 +708,6 @@ def main():
     parser.add_argument('--validate-only', action='store_true', help='Only validate existing packages')
     
     args = parser.parse_args()
-    is_production = args.environment == 'prod'
     
     # Create packager
     packager = LambdaPackager(args.project_root)
@@ -710,12 +731,9 @@ def main():
                     "--versioned-only is required for uploads; mutable "
                     "lambda-packages/*.zip publication is not supported"
                 )
-            selected = (
-                ['cost_analyzer_worker']
-                if args.worker_only
-                else None
-            )
-            package_paths = packager.package_lambdas(selected)
+            if args.sign and not args.upload_bucket:
+                raise ValueError("--sign requires --upload-bucket")
+            package_paths = packager.package_lambdas()
             source_commit = (
                 args.source_commit
                 or packager._git_revision('HEAD')
@@ -737,24 +755,23 @@ def main():
                     source_tree=source_tree,
                 )
                 
-                # Production: sign packages after upload
-                if is_production:
-                    print(f"\n🔐 Production deployment detected — signing Lambda packages...")
-                    print(f"   Prod Lambdas only accept packages signed by AWS Signer")
+                if args.sign:
+                    print(f"\n🔐 --sign: signing Lambda packages with AWS Signer...")
                     signed_keys = sign_lambda_packages(
                         package_paths=package_paths,
                         bucket_name=args.upload_bucket,
                         deployment_version=args.version,
+                        source_version_ids=packager.uploaded_version_ids,
                         signing_profile_name=args.signing_profile
                     )
                     print(
                         f"   ✓ {len(signed_keys)} packages signed in "
                         f"s3://{args.upload_bucket}/signed/v{args.version}/"
                     )
-                    print(f"   CloudFormation will use signed/ prefix (CodeSigningConfigArn: Enforce)")
+                    print(f"   Deploy with EnableCodeSigning=true to use the signed/ prefix")
                 else:
-                    print(f"\n📦 Non-prod deployment ({args.environment}) — skipping code signing")
-                    print(f"   To sign for prod, use: --environment prod --upload-bucket <bucket>")
+                    print(f"\n📦 Code signing skipped (deploy with EnableCodeSigning=false, the default)")
+                    print(f"   To sign, add --sign (requires a versioned bucket and an AWS Signer profile)")
 
             manifest_path = packager.create_deployment_manifest(
                 package_paths,
@@ -766,7 +783,7 @@ def main():
             
             print(f"\n🎉 Lambda packaging completed successfully!")
             print(f"   Environment: {args.environment}")
-            print(f"   Code signing: {'✅ ENABLED (prod)' if is_production else '⚠️  DISABLED (non-prod)'}")
+            print(f"   Code signing: {'ENABLED (--sign)' if args.sign else 'DISABLED'}")
             print(f"   Packages: {len(package_paths)}")
             print(f"   Manifest: {manifest_path}")
             

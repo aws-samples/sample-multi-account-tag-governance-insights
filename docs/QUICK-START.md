@@ -4,12 +4,14 @@ Fast deployment with pre-configured CloudFormation links.
 
 ## Prerequisites
 
-1. ✅ **AWS Resource Explorer** configured with an org-wide aggregator view (
-   see [DEPLOYMENT.md](DEPLOYMENT.md#aws-resource-explorer))
-2. ✅ **Lambda packages** built and uploaded to S3 bucket (
-   see [DEPLOYMENT.md](DEPLOYMENT.md#step-2-upload-lambda-packages))
-3. ✅ **IAM permissions** for CloudFormation deployment
-4. ✅ **AWS Organizations** — deploying from management account or delegated admin
+1. **AWS Resource Explorer** with an org-wide aggregator view (see
+   [DEPLOYMENT.md](DEPLOYMENT.md#1-aws-resource-explorer-required))
+2. **Lambda packages** built and uploaded to your code bucket (see
+   [DEPLOYMENT.md](DEPLOYMENT.md#step-1-upload-to-s3-2-minutes))
+3. **IAM permissions** for CloudFormation deployment
+4. **AWS Organizations**: you deploy from the management account or a delegated
+   administrator. The Coordinator fails if it cannot call
+   `organizations:ListAccounts`.
 
 ---
 
@@ -17,8 +19,9 @@ Fast deployment with pre-configured CloudFormation links.
 
 ### Steps 1-2: Build, upload, and deploy
 
-Follow [DEPLOYMENT.md](DEPLOYMENT.md) Step 1 (build and upload all 9 Lambda
-packages) and Step 2 (create the root `deploy.yaml` stack). Deploy the root
+Follow [DEPLOYMENT.md](DEPLOYMENT.md): set the shell variables, build and
+upload all 7 Lambda packages (Step 1), and create the root `deploy.yaml` stack
+named `TagInsights` (Step 2). Deploy the root
 stack, not individual nested templates: `core-stack.yaml` on its own creates
 storage only, not the scanner.
 
@@ -31,6 +34,9 @@ storage only, not the scanner.
 > ([S3 docs](https://docs.aws.amazon.com/AmazonS3/latest/userguide/enable-server-access-logging.html)).
 
 ### Step 3: Trigger initial scan
+
+The commands below use `ENV`, `REGION`, and `AWS_PROFILE`. Set `ENV` to the
+`Environment` you deployed (for example `ENV=test`).
 
 ```bash
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text --profile ${AWS_PROFILE})
@@ -54,8 +60,8 @@ After deployment completes:
 
 ```bash
 aws cloudformation describe-stacks \
-  --stack-name TagInsights-Core-prod \
-  --region us-east-1 \
+  --stack-name TagInsights \
+  --region ${REGION} \
   --query 'Stacks[0].StackStatus' \
   --profile ${AWS_PROFILE}
 # Should return: CREATE_COMPLETE
@@ -65,8 +71,8 @@ aws cloudformation describe-stacks \
 
 ```bash
 aws cloudformation describe-stacks \
-  --stack-name TagInsights-Core-prod \
-  --region us-east-1 \
+  --stack-name TagInsights \
+  --region ${REGION} \
   --query 'Stacks[0].Outputs' \
   --profile ${AWS_PROFILE}
 ```
@@ -84,8 +90,8 @@ ACCOUNT=$(aws sts get-caller-identity --query Account --output text --profile ${
 
 # Monitor checkpoint — updates every 10 completed account+region pairs
 aws s3 cp \
-  s3://ti-central-analytics-us-east-1-prod-${ACCOUNT}/aggregator-state/scan-checkpoint.json \
-  - | python3 -m json.tool
+  s3://ti-central-analytics-${REGION}-${ENV}-${ACCOUNT}/aggregator-state/scan-checkpoint.json \
+  - --profile ${AWS_PROFILE} | python3 -m json.tool
 ```
 
 ### 4. Check Data in S3
@@ -94,22 +100,26 @@ Wait ~5 minutes after first scan, then check for data:
 
 ```bash
 # List delta files
-aws s3 ls s3://ti-central-analytics-us-east-1-prod-ACCOUNT/deltas/ --recursive --profile ${AWS_PROFILE}
+aws s3 ls s3://ti-central-analytics-${REGION}-${ENV}-${ACCOUNT}/deltas/ --recursive --profile ${AWS_PROFILE}
 
 # Should see files like:
 # deltas/account_id=123456789012/region=us-east-1/2026-03-12-04-00-00-manual.json
 ```
 
-### 5. Repair Athena Partitions
+### 5. Repair Athena Partitions (recovery only)
+
+The Analytics Writer registers each partition as files land, so this is needed
+only if a registration failed (look for records in the results dead-letter
+queue).
 
 ```bash
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text --profile ${AWS_PROFILE})
 
 aws athena start-query-execution \
   --query-string "MSCK REPAIR TABLE resource_tag_deltas_recent" \
-  --query-execution-context "Database=ti_us-east-1_prod_${ACCOUNT}" \
-  --work-group "ti-us-east-1-prod-${ACCOUNT}" \
-  --region us-east-1 \
+  --query-execution-context "Database=ti_${REGION}_${ENV}_${ACCOUNT}" \
+  --work-group "ti-${REGION}-${ENV}-${ACCOUNT}" \
+  --region ${REGION} \
   --profile ${AWS_PROFILE}
 ```
 
@@ -138,8 +148,8 @@ LIMIT 20;
 
 ```bash
 aws cloudformation describe-stack-events \
-  --stack-name TagInsights-Core-prod \
-  --region us-east-1 \
+  --stack-name TagInsights \
+  --region ${REGION} \
   --query 'StackEvents[?ResourceStatus==`CREATE_FAILED`]' \
   --profile ${AWS_PROFILE}
 ```
@@ -154,7 +164,7 @@ aws cloudformation describe-stack-events \
 ### No Data Appearing
 
 1. **Check Resource Explorer** — Must have an org-wide aggregator view (ARN contains `/org/`)
-2. **Check Coordinator logs** — `aws logs tail /aws/lambda/ti-orches-prod-ACCOUNT --since 1h --profile ${AWS_PROFILE}`
+2. **Check Coordinator logs**: `aws logs tail /aws/lambda/ti-orches-${ENV}-${ACCOUNT} --since 1h --profile ${AWS_PROFILE}`
 3. **Check scan checkpoint** — Is scan still in progress?
 4. **Trigger manual scan** — Use the lambda invoke command above
 
@@ -163,14 +173,19 @@ aws cloudformation describe-stack-events \
 The Worker uses the org-wide RE view. Verify it exists:
 
 ```bash
-aws resource-explorer-2 list-views --profile ${AWS_PROFILE} | jq '.Views[] | select(contains("org"))'
+aws resource-explorer-2 list-views --region ${REGION} --profile ${AWS_PROFILE} \
+  | jq '.Views[] | select(contains("/view/org/"))'
 ```
+
+If your view has another name, set the `OrgViewArn` parameter to its ARN.
+Without an org view, member-account scans fail with an error in the Worker log.
 
 ### Cost Analysis Not Working
 
 1. **Configure CUR** — See [cost-analysis/README.md](cost-analysis/README.md)
-2. **Set CUR parameters** — `CurDatabaseName` and `CurTableName` must be set
-3. **Cross-account CUR** — If CUR is in a different account, set `CurAccountRoleArn`
+2. **Set CUR parameters**: `CurDatabaseName`, `CurTableName`, and `CurBucketName` must be set
+3. **Cross-account CUR** — If CUR is in a different account, set `CurCatalogAccountId` and apply the billing-account
+   grants in [cost-analysis/README.md](cost-analysis/README.md#cross-account-cur-setup)
 
 ---
 
@@ -178,11 +193,10 @@ aws resource-explorer-2 list-views --profile ${AWS_PROFILE} | jq '.Views[] | sel
 
 After successful deployment:
 
-1. ✅ **Set up monitoring** — Check CloudWatch dashboards and alarms (`ti-orches-errors-ENV`, etc.)
-
-2. ✅ **Query your data** — Use Athena or visualization tools
-
-3. ✅ **Read operations guide** — See [OPERATIONS.md](OPERATIONS.md)
-
-4. ✅ **Deploy EventForwarder StackSet** — Enable real-time tag changes from member accounts (
-   see [DEPLOYMENT.md](DEPLOYMENT.md))
+1. **Set up monitoring**: check the CloudWatch alarms (`ti-orches-errors-ENV`
+   and the others listed in [OPERATIONS.md](OPERATIONS.md#monitoring))
+2. **Query your data**: use Athena or visualization tools
+3. **Read the operations guide**: see [OPERATIONS.md](OPERATIONS.md)
+4. **Deploy the EventForwarder StackSet**: enable real-time tag changes from
+   member accounts (see
+   [DEPLOYMENT.md](DEPLOYMENT.md#step-3-deploy-event-forwarder-to-member-accounts-real-time-events))

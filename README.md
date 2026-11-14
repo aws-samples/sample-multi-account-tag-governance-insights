@@ -15,12 +15,12 @@ provides analytics for cost attribution and tagging gaps.
 ## Features
 
 - **Multi-account tag collection** — Coordinator with resumable checkpoint-based scanning across all org accounts
-- **Real-time tag change detection** — EventBridge forwards CloudTrail tag API calls from 45 AWS services (requires a CloudTrail trail)
+- **Real-time tag change detection**: EventBridge forwards CloudTrail tag API calls from 45 AWS services (requires a CloudTrail trail) and records who made each change in the `tag_change_events` table (`changed_by`)
 - **Resource Explorer-based discovery** — Org-wide RE view via direct boto3 calls for 300+ resource types, no
   per-service permissions needed
 - **Delta-based processing** — Only changed resources are processed each scan
 - **Parquet analytics** — Tag data stored as partitioned Parquet for efficient Athena querying
-- **Tag-based cost analysis** — Matches resource ARNs to CUR data directly via Athena; Cost Explorer fallback opt-in
+- **Tag-based cost analysis** — Daily cost by tag from CUR via Athena, attributed to the tags valid at each usage hour
 
 ---
 
@@ -29,7 +29,7 @@ provides analytics for cost attribution and tagging gaps.
 TagInsights uses a hub-and-spoke model:
 
 - **Hub account** — All Lambda functions run here: Coordinator, Worker, Analytics Writer, Monthly Aggregator, Cost
-  Lambdas
+  Allocator
 - **Central analytics** — S3 bucket (`ti-central-analytics-REGION-ENV-ACCOUNT`), Glue/Athena, SQS queue (
   `ti-central-results-ENV-ACCOUNT`)
 - **Worker** — Uses org-wide Resource Explorer view to scan all accounts from the hub; no per-account deployments needed
@@ -46,7 +46,8 @@ diagrams.
 ### AWS Resource Explorer
 
 Enable Resource Explorer org-wide and create an org-scoped view **named `org`**
-in the hub account before deploying. See
+in the hub account before deploying, or pass your view's ARN in the
+`OrgViewArn` parameter. See
 [DEPLOYMENT.md → AWS Resource Explorer](docs/DEPLOYMENT.md#1-aws-resource-explorer-required).
 
 Resource Explorer is free and provides a single `resource-explorer-2:Search` permission for 300+ resource types.
@@ -58,6 +59,15 @@ every member account and region, ideally one organization trail. Without it,
 tag changes appear only after the next scheduled scan. See
 [DEPLOYMENT.md → AWS CloudTrail](docs/DEPLOYMENT.md#2-aws-cloudtrail-required-for-real-time-events).
 
+### AWS Organizations
+
+Deploy in the management account or in a delegated administrator account. The
+Coordinator calls `organizations:ListAccounts` and fails without that access.
+
+### Build tools
+
+Python 3.9 or later with `pip`, to build the Lambda packages, and the AWS CLI.
+
 ### Required AWS Services
 
 CloudFormation, Lambda, S3, SQS, EventBridge, Athena, Glue, IAM, AWS Organizations, Resource Explorer, CloudTrail
@@ -65,7 +75,8 @@ CloudFormation, Lambda, S3, SQS, EventBridge, Athena, Glue, IAM, AWS Organizatio
 ### Deployer Permissions
 
 The deploying user/role needs permissions to create CloudFormation stacks, IAM roles, Lambda functions, S3 buckets, SQS
-queues, EventBridge rules, Glue databases, and Athena workgroups.
+queues, EventBridge rules, Glue databases, Athena workgroups, and a Secrets Manager secret (encrypted with the
+stack's KMS key).
 
 ---
 
@@ -113,13 +124,10 @@ All TagInsights resources use the `ti-` prefix:
 | Worker Lambda             | `ti-worker-{ENV}-{ACCOUNT}`                     |
 | Analytics Writer Lambda   | `ti-analytics-{ENV}-{ACCOUNT}`                  |
 | Monthly Aggregator Lambda | `ti-monthly-agg-{ENV}-{ACCOUNT}`                |
-| Cost Coordinator Lambda   | `ti-cost-orches-{ENV}-{ACCOUNT}`                |
-| Cost Worker Lambda        | `ti-cost-worker-{ENV}-{ACCOUNT}`                |
-| Cost Deduplicator Lambda  | `ti-cost-dedup-{ENV}-{ACCOUNT}`                 |
+| Cost Allocator Lambda     | `ti-cost-alloc-{ENV}-{ACCOUNT}`                 |
 | Central Analytics S3      | `ti-central-analytics-{REGION}-{ENV}-{ACCOUNT}` |
 | Athena Results S3         | `ti-athena-results-{REGION}-{ENV}-{ACCOUNT}`    |
 | Results SQS Queue         | `ti-central-results-{ENV}-{ACCOUNT}`            |
-| Cost Work FIFO Queue      | `ti-cost-analysis-work-{ENV}.fifo`              |
 | Athena Workgroup          | `ti-{REGION}-{ENV}-{ACCOUNT}`                   |
 | Glue Database             | `ti_{REGION}_{ENV}_{ACCOUNT}`                   |
 | EventForwarder StackSet   | `TagInsights-EventForwarder`                    |
@@ -138,7 +146,7 @@ All TagInsights resources use the `ti-` prefix:
 | [OPERATIONS.md](docs/OPERATIONS.md)                                     | Monitoring, troubleshooting, stack management                 |
 | [SECURITY.md](docs/SECURITY.md)                                         | IAM design, encryption, compliance notes                      |
 | [SOFTWARE_DESIGN_DOCUMENT.md](docs/SOFTWARE_DESIGN_DOCUMENT.md)         | Component design, data schemas, deployment design             |
-| [cost-analysis/README.md](docs/cost-analysis/README.md)                 | Cost analysis feature (CUR matching + Cost Explorer fallback) |
+| [cost-analysis/README.md](docs/cost-analysis/README.md)                 | Cost analysis feature (cost allocator, cross-account CUR)     |
 | [cost-analysis/QUERY_EXAMPLES.md](docs/cost-analysis/QUERY_EXAMPLES.md) | Athena queries for cost analysis                              |
 
 ---
@@ -164,18 +172,15 @@ costs scale mainly with tag change volume and how often you query Athena.
 ```
 src/
 ├── __init__.py
-├── tag_manager.py
 ├── lambda_handlers/          # Lambda entry points
 │   ├── aggregator_coordinator.py
 │   ├── aggregator_worker.py
 │   ├── analytics_writer_handler.py
 │   ├── monthly_aggregator_handler.py
 │   └── cost/                 # Cost analysis handlers + library
-│       ├── cost_analyzer_coordinator_handler.py
-│       ├── cost_analyzer_worker_handler.py
-│       ├── cost_deduplicator_handler.py
+│       ├── cost_allocator_handler.py
+│       ├── allocation_query.py
 │       └── ...
-├── tag_retrievers/           # Resource Explorer integration
 └── utils/                    # Shared utilities
 
 deployment/                   # CloudFormation templates and build scripts
@@ -194,10 +199,7 @@ deployment/                   # CloudFormation templates and build scripts
   (ideally an organization trail). Without one, tag changes appear only after the next daily scan.
 - **The management account is not tracked in real time.** Service-managed StackSets never deploy to it; its tag
   changes are picked up by the daily scan.
-- **`last_month_cost` is not populated yet (always 0).** Month-over-month cost queries return no rows until it is.
-  `current_month_mtd`, `avg_daily_cost` and `current_month_projected` are populated.
-- **`tag_costs` lags one day.** The deduplicator compacts the previous day's results. To compact today's results,
-  invoke it with `{"process_date": "YYYY-MM-DD"}`.
+- **Cost data lags CUR by 24-48 hours.** The cost allocator runs daily and recomputes the current and previous month.
 - **Not tested in AWS GovCloud (US) or China Regions.**
 - **Very large account-Regions are not sharded.** The worker logs a warning when one account-Region exceeds
   `STATE_SHARD_THRESHOLD` resources (default 50,000).

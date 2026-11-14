@@ -62,9 +62,11 @@ Parameters:
   CheckpointSigningSecret:
     Type: String
     NoEcho: true
+    MinLength: 32
     Description: >
       Secret used to HMAC-sign scan checkpoints (tamper detection).
-      Required. Generate with 'openssl rand -hex 32'.
+      Required, at least 32 characters. Generate with 'openssl rand -hex 32'.
+      Stored in Secrets Manager; the Coordinator reads it from there.
 
   LogLevel:
     Type: String
@@ -76,6 +78,32 @@ Parameters:
     Type: String
     Default: "false"
     AllowedValues: ["true", "false"]
+
+  EnableCodeSigning:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Opt in to Lambda code signing (Enforce) for functions without layers and
+      deploy signed/ packages. Requires the taginsights-lambda-signer profile.
+      Functions that attach the AWS-published pandas layer never get a code
+      signing config, because that layer is not signed by your profile.
+
+  PandasLayerArn:
+    Type: String
+    Default: ""
+    Description: >
+      AWS SDK for pandas layer ARN for Python 3.14. Empty uses
+      arn:<partition>:lambda:<region>:336392948345:layer:AWSSDKPandas-Python314:12.
+      Layer versions differ per Region; check the AWS SDK for pandas docs
+      for your Region and override here if version 12 is not published there.
+
+  OrgViewArn:
+    Type: String
+    Default: ""
+    Description: >
+      Resource Explorer org-wide view ARN in HubRegion. Empty auto-discovers a
+      view whose ARN contains '/org/'. Member scans fail if no org view exists.
 
 Conditions:
   EnableAggressiveCleanup: !Or
@@ -92,8 +120,8 @@ Conditions:
     - !Condition EnableRealTimeEventsCondition
     - !Equals [!Ref EnableEventBridgeExtension, "true"]
 
-  # Code signing enforced on prod only — dev/test/cert/uat/staging can deploy unsigned for velocity
-  IsProduction: !Equals [!Ref Environment, "prod"]
+  UseCodeSigning: !Equals [!Ref EnableCodeSigning, "true"]
+  HasPandasLayerArn: !Not [!Equals [!Ref PandasLayerArn, ""]]
 
 Resources:
   # ============================================================================
@@ -118,7 +146,7 @@ Resources:
               StringEquals:
                 aws:SourceAccount: !Ref AWS::AccountId
       ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
       Policies:
         - PolicyName: CoordinatorPolicy
           PolicyDocument:
@@ -130,7 +158,7 @@ Resources:
                   - organizations:ListAccounts
                   - organizations:DescribeOrganization
                 Resource: "*"
-              # RE index list (fallback account discovery if not management account)
+              # RE index list (which Regions to scan)
               - Effect: Allow
                 Action:
                   - resource-explorer-2:ListIndexes
@@ -161,6 +189,49 @@ Resources:
                 Action:
                   - cloudwatch:PutMetricData
                 Resource: "*"
+              # Read the checkpoint signing secret (this one secret only)
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref CheckpointSecret
+              # Decrypt it with the messaging key, only through Secrets Manager
+              - Effect: Allow
+                Action: kms:Decrypt
+                Resource: !ImportValue
+                  Fn::Sub: "ti-messaging-key-arn-${Environment}"
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub "secretsmanager.${AWS::Region}.${AWS::URLSuffix}"
+
+  # ============================================================================
+  # CHECKPOINT SIGNING SECRET
+  # HMAC key for scan checkpoints. Kept out of Lambda environment variables so
+  # lambda:GetFunctionConfiguration cannot read it. Encrypted with the core
+  # stack's messaging key; its key policy delegates to IAM (account root), so
+  # the Coordinator's kms:Decrypt grant above is enough.
+  # ============================================================================
+
+  CheckpointSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: !If [EnableAggressiveCleanup, Delete, Retain]
+    UpdateReplacePolicy: !If [EnableAggressiveCleanup, Delete, Retain]
+    # Rotation is out of scope: the value comes from the CheckpointSigningSecret
+    # parameter, and every update-stack must pass the same value, so a rotated
+    # secret would be overwritten. Rotate by passing a new parameter value
+    # (in-flight checkpoints are then rejected and the next scan starts fresh).
+    Metadata:
+      guard:
+        SuppressedRules:
+          - SECRETSMANAGER_ROTATION_ENABLED_CHECK
+    Properties:
+      Description: !Sub "TagInsights checkpoint HMAC signing secret (${Environment})"
+      KmsKeyId: !ImportValue
+        Fn::Sub: "ti-messaging-key-arn-${Environment}"
+      SecretString: !Ref CheckpointSigningSecret
+      Tags:
+        - Key: Application
+          Value: TagInsights
+        - Key: Environment
+          Value: !Ref Environment
 
   # ============================================================================
   # IAM ROLE — WORKER LAMBDA
@@ -184,21 +255,20 @@ Resources:
               StringEquals:
                 aws:SourceAccount: !Ref AWS::AccountId
       ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
       Policies:
         - PolicyName: WorkerPolicy
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
-              # Resource Explorer — org-wide search via aggregator index
+              # Resource Explorer — list resources through the org-wide view.
+              # ListResources is authorized by resource-explorer-2:Search (verified
+              # live: AccessDenied without it), so both actions are required.
               - Effect: Allow
                 Action:
-                  - resource-explorer-2:Search
                   - resource-explorer-2:ListResources
-                  - resource-explorer-2:ListIndexes
+                  - resource-explorer-2:Search
                   - resource-explorer-2:ListViews
-                  - resource-explorer-2:GetIndex
-                  - resource-explorer-2:ListSupportedResourceTypes
                 Resource: "*"
               # Read previous state + write deltas to central analytics bucket
               - Effect: Allow
@@ -224,11 +294,11 @@ Resources:
                 Resource:
                   - !ImportValue
                     Fn::Sub: "ti-central-results-queue-arn-${Environment}"
-              # CloudWatch metrics
+              # Async-invoke failure destination (coordinator fan-out)
               - Effect: Allow
                 Action:
-                  - cloudwatch:PutMetricData
-                Resource: "*"
+                  - sqs:SendMessage
+                Resource: !GetAtt WorkerFailureQueue.Arn
 
   # ============================================================================
   # IAM ROLE — ANALYTICS WRITER LAMBDA
@@ -252,7 +322,7 @@ Resources:
               StringEquals:
                 aws:SourceAccount: !Ref AWS::AccountId
       ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
       Policies:
         - PolicyName: AnalyticsWriterPolicy
           PolicyDocument:
@@ -262,7 +332,6 @@ Resources:
               - Effect: Allow
                 Action:
                   - s3:GetObject
-                  - s3:HeadObject
                   - s3:PutObject
                   - s3:DeleteObject
                   - s3:ListBucket
@@ -297,13 +366,13 @@ Resources:
                   - glue:BatchCreatePartition
                   - glue:UpdatePartition
                 Resource:
-                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog"
                   - !Sub
-                    - "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${DbName}"
+                    - "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${DbName}"
                     - DbName: !ImportValue
                         Fn::Sub: "ti-glue-database-${Environment}"
                   - !Sub
-                    - "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${DbName}/*"
+                    - "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${DbName}/*"
                     - DbName: !ImportValue
                         Fn::Sub: "ti-glue-database-${Environment}"
               # CloudWatch metrics
@@ -342,7 +411,8 @@ Resources:
       QueueName: !Sub "${ProjectName}-forwarded-events-${Environment}"
       KmsMasterKeyId: !ImportValue
         Fn::Sub: "ti-messaging-key-arn-${Environment}"
-      VisibilityTimeout: 1800
+      # >= 6x the Worker timeout (900 s), per Lambda's SQS guidance
+      VisibilityTimeout: 5400
       MessageRetentionPeriod: 86400
       ReceiveMessageWaitTimeSeconds: 20
       RedrivePolicy:
@@ -372,7 +442,7 @@ Resources:
             Condition:
               ArnEquals:
                 "aws:SourceArn": !Sub
-                  - "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/${BusName}/${ProjectName}-forwarded-tag-changes-${Environment}"
+                  - "arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/${BusName}/${ProjectName}-forwarded-tag-changes-${Environment}"
                   - BusName: !ImportValue
                       Fn::Sub: "ti-hub-event-bus-name-${Environment}"
 
@@ -397,12 +467,28 @@ Resources:
             Resource: !ImportValue
               Fn::Sub: "ti-messaging-key-arn-${Environment}"
 
+  # Failed async Worker invocations (coordinator fan-out) after retries
+  WorkerFailureQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: !If [EnableAggressiveCleanup, Delete, Retain]
+    UpdateReplacePolicy: !If [EnableAggressiveCleanup, Delete, Retain]
+    Properties:
+      QueueName: !Sub "${ProjectName}-worker-failures-${Environment}"
+      KmsMasterKeyId: alias/aws/sqs
+      MessageRetentionPeriod: 1209600
+      Tags:
+        - Key: Application
+          Value: TagInsights
+        - Key: Environment
+          Value: !Ref Environment
+
   # ============================================================================
-  # LAMBDA CODE SIGNING (PRODUCTION ONLY)
-  # Enforces that only cryptographically signed packages can be deployed to prod.
-  # Dev/test/cert/uat/staging environments skip signing for deployment velocity.
+  # LAMBDA CODE SIGNING (OPT-IN: EnableCodeSigning=true)
+  # Enforces that only cryptographically signed packages can be deployed.
+  # Not attached to functions using the AWS-published pandas layer: Lambda
+  # also checks layers, and that layer is not signed by your profile.
   #
-  # ONE-TIME SETUP (per region, per account) before first prod deployment:
+  # ONE-TIME SETUP (per region, per account) before enabling:
   #   aws signer put-signing-profile \
   #     --profile-name taginsights-lambda-signer \
   #     --platform-id AWSLambda-SHA384-ECDSA \
@@ -411,12 +497,12 @@ Resources:
 
   LambdaCodeSigningConfig:
     Type: AWS::Lambda::CodeSigningConfig
-    Condition: IsProduction
+    Condition: UseCodeSigning
     Properties:
       Description: !Sub "TagInsights Lambda code signing enforcement — ${Environment}"
       AllowedPublishers:
         SigningProfileVersionArns:
-          - !Sub "arn:aws:signer:${AWS::Region}:${AWS::AccountId}:/signing-profiles/taginsights-lambda-signer"
+          - !Sub "arn:${AWS::Partition}:signer:${AWS::Region}:${AWS::AccountId}:/signing-profiles/taginsights-lambda-signer"
       CodeSigningPolicies:
         # Enforce: reject unsigned or tampered code from deploying to prod
         # This blocks insider code injection — only CI/CD-signed packages are accepted
@@ -439,11 +525,13 @@ Resources:
     UpdateReplacePolicy: !If [EnableAggressiveCleanup, Delete, Retain]
     Properties:
       FunctionName: !Sub "${ProjectName}-orches-${Environment}-${AWS::AccountId}"
-      Runtime: python3.11
+      Runtime: python3.14
       Handler: aggregator_coordinator.lambda_handler
       Role: !GetAtt CoordinatorRole.Arn
       Timeout: 900
       MemorySize: 512
+      # One run at a time: overlapping runs would race on the checkpoint.
+      ReservedConcurrentExecutions: 1
       Environment:
         Variables:
           PROJECT_NAME: !Ref ProjectName
@@ -454,14 +542,14 @@ Resources:
           WORKER_FUNCTION_NAME: !Ref WorkerLambda
           MAX_SCAN_DAYS: !Ref MaxScanDays
           LOG_LEVEL: !Ref LogLevel
-          CHECKPOINT_SIGNING_SECRET: !Ref CheckpointSigningSecret
-      # Prod: use signed package from CI/CD pipeline. Non-prod: unsigned for velocity.
+          CHECKPOINT_SECRET_ARN: !Ref CheckpointSecret
+      # EnableCodeSigning=true: signed package from CI/CD, enforced by the CSC.
       CodeSigningConfigArn:
-        !If [IsProduction, !Ref LambdaCodeSigningConfig, !Ref AWS::NoValue]
+        !If [UseCodeSigning, !Ref LambdaCodeSigningConfig, !Ref AWS::NoValue]
       Code:
         S3Bucket: !Ref LambdaCodeBucket
         S3Key: !If
-          - IsProduction
+          - UseCodeSigning
           - !Sub "signed/v${DeploymentVersion}/aggregator_coordinator.zip"
           - !Sub "lambda-packages/v${DeploymentVersion}/aggregator_coordinator.zip"
       Tags:
@@ -478,7 +566,7 @@ Resources:
     UpdateReplacePolicy: !If [EnableAggressiveCleanup, Delete, Retain]
     Properties:
       FunctionName: !Sub "${ProjectName}-worker-${Environment}-${AWS::AccountId}"
-      Runtime: python3.11
+      Runtime: python3.14
       Handler: aggregator_worker.lambda_handler
       Role: !GetAtt WorkerRole.Arn
       Timeout: 900
@@ -493,13 +581,14 @@ Resources:
             Fn::Sub: "ti-central-analytics-bucket-${Environment}"
           CENTRAL_RESULTS_QUEUE_URL: !ImportValue
             Fn::Sub: "ti-central-results-queue-url-${Environment}"
+          ORG_VIEW_ARN: !Ref OrgViewArn
           LOG_LEVEL: !Ref LogLevel
       CodeSigningConfigArn:
-        !If [IsProduction, !Ref LambdaCodeSigningConfig, !Ref AWS::NoValue]
+        !If [UseCodeSigning, !Ref LambdaCodeSigningConfig, !Ref AWS::NoValue]
       Code:
         S3Bucket: !Ref LambdaCodeBucket
         S3Key: !If
-          - IsProduction
+          - UseCodeSigning
           - !Sub "signed/v${DeploymentVersion}/aggregator_worker.zip"
           - !Sub "lambda-packages/v${DeploymentVersion}/aggregator_worker.zip"
       Tags:
@@ -510,20 +599,35 @@ Resources:
         - Key: Component
           Value: Worker
 
+  # Async (fan-out) invocations: bounded retries, then record the failure.
+  WorkerEventInvokeConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref WorkerLambda
+      Qualifier: $LATEST
+      MaximumRetryAttempts: 2
+      MaximumEventAgeInSeconds: 21600
+      DestinationConfig:
+        OnFailure:
+          Destination: !GetAtt WorkerFailureQueue.Arn
+
   AnalyticsWriterLambda:
     Type: AWS::Lambda::Function
     DeletionPolicy: !If [EnableAggressiveCleanup, Delete, Retain]
     UpdateReplacePolicy: !If [EnableAggressiveCleanup, Delete, Retain]
     Properties:
       FunctionName: !Sub "${ProjectName}-analytics-${Environment}-${AWS::AccountId}"
-      Runtime: python3.11
+      Runtime: python3.14
       Handler: analytics_writer_handler.lambda_handler
       Role: !GetAtt AnalyticsWriterRole.Arn
       Timeout: 300
       MemorySize: 1024
       ReservedConcurrentExecutions: 20
       Layers:
-        - !Sub "arn:aws:lambda:${AWS::Region}:336392948345:layer:AWSSDKPandas-Python311:13"
+        - !If
+          - HasPandasLayerArn
+          - !Ref PandasLayerArn
+          - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:336392948345:layer:AWSSDKPandas-Python314:12"
       Environment:
         Variables:
           PROJECT_NAME: !Ref ProjectName
@@ -538,12 +642,12 @@ Resources:
           ATHENA_RESULTS_BUCKET: !ImportValue
             Fn::Sub: "ti-athena-results-bucket-${Environment}"
           LOG_LEVEL: !Ref LogLevel
-      CodeSigningConfigArn:
-        !If [IsProduction, !Ref LambdaCodeSigningConfig, !Ref AWS::NoValue]
+      # No CodeSigningConfig: the AWS-published pandas layer is not signed
+      # by your signing profile, so Enforce would reject the deployment.
       Code:
         S3Bucket: !Ref LambdaCodeBucket
         S3Key: !If
-          - IsProduction
+          - UseCodeSigning
           - !Sub "signed/v${DeploymentVersion}/analytics_writer.zip"
           - !Sub "lambda-packages/v${DeploymentVersion}/analytics_writer.zip"
       Tags:
@@ -564,6 +668,8 @@ Resources:
       BatchSize: 10
       MaximumBatchingWindowInSeconds: 5
       Enabled: true
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
       ScalingConfig:
         MaximumConcurrency: 20
 
@@ -578,8 +684,11 @@ Resources:
       BatchSize: 10
       MaximumBatchingWindowInSeconds: 5
       Enabled: true
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+      # Below the Worker's reservation (20) so scheduled scans keep capacity
       ScalingConfig:
-        MaximumConcurrency: 20
+        MaximumConcurrency: 10
 
   # ============================================================================
   # EVENTBRIDGE RULES
@@ -625,7 +734,11 @@ Resources:
       # "Tag Change on Resource" event (covers creation-time tags, full tag set).
       EventPattern:
         $or:
-          - detail-type:
+          # source "aws.*" can only be set by AWS services (PutEvents rejects
+          # it), so a member account cannot inject hand-crafted events.
+          - source:
+              - prefix: "aws."
+            detail-type:
               - AWS API Call via CloudTrail
             detail:
               eventName:
@@ -737,6 +850,23 @@ Resources:
           Value: !GetAtt ForwardedEventsDLQ.QueueName
       TreatMissingData: notBreaching
 
+  WorkerFailureQueueAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-worker-failures-${Environment}"
+      AlarmDescription: "Fan-out Worker invocations failed after retries (see worker-failures queue)"
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt WorkerFailureQueue.QueueName
+      TreatMissingData: notBreaching
+
   # ============================================================================
   # CLOUDWATCH LOG GROUPS
   # ============================================================================
@@ -776,9 +906,9 @@ Resources:
 
   # ============================================================================
   # MONTHLY AGGREGATOR
-  # Compresses 90-day-old daily partitions into monthly summaries in
-  # resource_tag_deltas_historical. Reduces partition count 90x and
-  # saves storage/query cost. Runs on day 2 of each month at 3 AM UTC.
+  # Compacts the month that ended at least 28 days earlier into one row per
+  # resource in resource_tag_deltas_historical, which keeps file and partition
+  # counts low for Athena. Runs on day 2 of each month at 3 AM UTC.
   # ============================================================================
 
   MonthlyAggregatorRole:
@@ -798,7 +928,7 @@ Resources:
               StringEquals:
                 aws:SourceAccount: !Ref AWS::AccountId
       ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
       Policies:
         - PolicyName: MonthlyAggregatorPolicy
           PolicyDocument:
@@ -807,30 +937,43 @@ Resources:
               # Read daily partitions + write/delete monthly partitions in central bucket
               - Effect: Allow
                 Action:
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !ImportValue
+                    Fn::Sub: "ti-central-analytics-bucket-arn-${Environment}"
+              # Read and delete compacted daily deltas
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub
+                    - "${BucketArn}/tag-deltas/recent/*"
+                    - BucketArn: !ImportValue
+                        Fn::Sub: "ti-central-analytics-bucket-arn-${Environment}"
+              # Athena UNLOAD writes (and reruns clear) monthly partitions
+              - Effect: Allow
+                Action:
                   - s3:GetObject
                   - s3:PutObject
                   - s3:DeleteObject
-                  - s3:ListBucket
+                  - s3:AbortMultipartUpload
                 Resource:
                   - !Sub
-                    - "${BucketArn}"
+                    - "${BucketArn}/tag-deltas/historical/*"
                     - BucketArn: !ImportValue
                         Fn::Sub: "ti-central-analytics-bucket-arn-${Environment}"
-                  - !Sub
-                    - "${BucketArn}/*"
-                    - BucketArn: !ImportValue
-                        Fn::Sub: "ti-central-analytics-bucket-arn-${Environment}"
-              # Athena query execution for account discovery + daily data reads
+              # Athena UNLOAD for the monthly compaction
               - Effect: Allow
                 Action:
                   - athena:StartQueryExecution
                   - athena:GetQueryExecution
-                  - athena:GetQueryResults
                   - athena:StopQueryExecution
                   - athena:GetWorkGroup
                 Resource:
                   - !Sub
-                    - "arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${Wg}"
+                    - "arn:${AWS::Partition}:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${Wg}"
                     - Wg: !ImportValue
                         Fn::Sub: "ti-athena-workgroup-${Environment}"
               # Athena results bucket
@@ -841,8 +984,8 @@ Resources:
                   - s3:ListBucket
                   - s3:GetBucketLocation
                 Resource:
-                  - !Sub "arn:aws:s3:::ti-athena-results-${AWS::Region}-${Environment}-${AWS::AccountId}"
-                  - !Sub "arn:aws:s3:::ti-athena-results-${AWS::Region}-${Environment}-${AWS::AccountId}/*"
+                  - !Sub "arn:${AWS::Partition}:s3:::ti-athena-results-${AWS::Region}-${Environment}-${AWS::AccountId}"
+                  - !Sub "arn:${AWS::Partition}:s3:::ti-athena-results-${AWS::Region}-${Environment}-${AWS::AccountId}/*"
               # Glue — read recent + read/write/delete historical table partitions
               - Effect: Allow
                 Action:
@@ -857,20 +1000,15 @@ Resources:
                   - glue:BatchDeletePartition
                   - glue:UpdatePartition
                 Resource:
-                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog"
                   - !Sub
-                    - "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${Db}"
+                    - "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${Db}"
                     - Db: !ImportValue
                         Fn::Sub: "ti-glue-database-${Environment}"
                   - !Sub
-                    - "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${Db}/*"
+                    - "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${Db}/*"
                     - Db: !ImportValue
                         Fn::Sub: "ti-glue-database-${Environment}"
-              # CloudWatch metrics
-              - Effect: Allow
-                Action:
-                  - cloudwatch:PutMetricData
-                Resource: "*"
 
   MonthlyAggregatorLambda:
     Type: AWS::Lambda::Function
@@ -878,13 +1016,11 @@ Resources:
     UpdateReplacePolicy: !If [EnableAggressiveCleanup, Delete, Retain]
     Properties:
       FunctionName: !Sub "${ProjectName}-monthly-agg-${Environment}-${AWS::AccountId}"
-      Runtime: python3.11
+      Runtime: python3.14
       Handler: monthly_aggregator_handler.lambda_handler
       Role: !GetAtt MonthlyAggregatorRole.Arn
       Timeout: 900
-      MemorySize: 2048
-      Layers:
-        - !Sub "arn:aws:lambda:${AWS::Region}:336392948345:layer:AWSSDKPandas-Python311:13"
+      MemorySize: 256
       Environment:
         Variables:
           PROJECT_NAME: !Ref ProjectName
@@ -896,14 +1032,14 @@ Resources:
             Fn::Sub: "ti-glue-database-${Environment}"
           ATHENA_WORKGROUP: !ImportValue
             Fn::Sub: "ti-athena-workgroup-${Environment}"
-          RETENTION_DAYS: "90"
           LOG_LEVEL: !Ref LogLevel
+      # No layers (Athena writes the Parquet), so code signing can apply.
       CodeSigningConfigArn:
-        !If [IsProduction, !Ref LambdaCodeSigningConfig, !Ref AWS::NoValue]
+        !If [UseCodeSigning, !Ref LambdaCodeSigningConfig, !Ref AWS::NoValue]
       Code:
         S3Bucket: !Ref LambdaCodeBucket
         S3Key: !If
-          - IsProduction
+          - UseCodeSigning
           - !Sub "signed/v${DeploymentVersion}/monthly_aggregator.zip"
           - !Sub "lambda-packages/v${DeploymentVersion}/monthly_aggregator.zip"
       Tags:
@@ -918,7 +1054,7 @@ Resources:
     Type: AWS::Events::Rule
     Properties:
       Name: !Sub "${ProjectName}-monthly-aggregation-${Environment}"
-      Description: "TagInsights monthly aggregation — compresses 90-day-old daily partitions into monthly summaries (day 2 of each month, 3 AM UTC)"
+      Description: "TagInsights monthly aggregation — compacts the month that ended >= 28 days ago into monthly summaries (day 2 of each month, 3 AM UTC)"
       State: ENABLED
       ScheduleExpression: "cron(0 3 2 * ? *)"
       Targets:

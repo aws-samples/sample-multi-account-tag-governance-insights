@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: "TagInsights - Cost Analysis Stack (Athena-based, 12-hour incremental processing)"
+Description: "TagInsights - Cost Analysis Stack (daily set-based tag cost allocation from CUR via Athena UNLOAD)"
 
 Parameters:
   ProjectName:
@@ -17,20 +17,11 @@ Parameters:
     Type: String
     Description: S3 bucket name for Lambda deployment artifacts
 
-  CostAnalysisScheduleExpression:
-    Type: String
-    Default: "cron(0 */12 * * ? *)"
-    Description: EventBridge schedule for running cost analysis (default every 12 hours)
-
-  # ── CUR integration ───────────────────────────────────────────────────────
-  # Required for tag-based cost allocation using CUR Athena tables.
-  # Permissions are scoped to the specific database and table provided.
-
   CurDatabaseName:
     Type: String
     Default: ""
     Description: >
-      Glue database name for the CUR table. When provided, the worker Lambda
+      Glue database name for the CUR table. When provided, the cost allocator
       role is granted Glue permissions scoped to this database only.
 
   CurTableName:
@@ -44,35 +35,19 @@ Parameters:
     AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
     ConstraintDescription: "Must be a valid S3 bucket name (3-63 chars, lowercase, no empty strings)"
     Description: >
-      S3 bucket name where CUR data is stored (e.g., 'my-cur-report-bucket').
+      S3 bucket name where CUR data is stored (e.g., 'amzn-s3-demo-cur-bucket').
       Required — IAM access is scoped to this specific bucket.
 
-  CurAccountRoleArn:
+  CurCatalogAccountId:
     Type: String
     Default: ""
-    AllowedPattern: "^(arn:aws:iam::[0-9]{12}:role/.+)?$"
-    ConstraintDescription: >
-      Must be empty or a valid IAM role ARN: arn:aws:iam::{account}:role/{role-name}.
+    AllowedPattern: "^([0-9]{12})?$"
     Description: >
-      IAM role ARN to assume for cross-account CUR access.
-      Leave empty when CUR is in the same account as the hub — the worker
-      Lambda's own execution role will be used automatically.
-      Only required when the CUR Athena table is in a separate billing account.
-
-  CurExternalId:
-    Type: String
-    Default: ""
-    NoEcho: true
-    Description: >
-      External ID for cross-account CUR role assumption (confused-deputy protection).
-      Must match the ExternalId condition in the CUR reader role trust policy.
-
-  CurAthenaResultsBucket:
-    Type: String
-    Default: ""
-    Description: >
-      Optional Athena results bucket in the CUR account. Leave empty to use
-      the TagInsights Athena results bucket.
+      Billing account that owns the CUR Glue table, when it is not this account.
+      Registers that account's Glue Data Catalog in Athena so the cost allocator
+      can join CUR to tag history in one query. The billing account must grant
+      the allocator role Glue and S3 read (docs/cost-analysis/README.md,
+      "Cross-account CUR"). Leave empty when CUR is in this account.
 
   DeploymentVersion:
     Type: String
@@ -81,99 +56,65 @@ Parameters:
       Must be 1-64 letters, numbers, dots, underscores, or hyphens.
     Description: Immutable version segment shared by all Lambda ZIPs.
 
-  EnableCostExplorerFallback:
+  EnableCodeSigning:
     Type: String
     Default: "false"
     AllowedValues: ["true", "false"]
     Description: >
-      Allow the SmartCostProvider to fall back to AWS Cost Explorer APIs when CUR
-      is not configured or unavailable. Cost Explorer charges $0.01 per API request —
-      with 50+ tag values and a 12-hourly schedule this can add $5-20/month.
-      Default: false (disabled). Set true only if you intentionally want Cost Explorer
-      as a backup data source and have accepted the potential additional charges.
+      Enforce AWS Signer code signing on the Lambda and load it from signed/v<version>/.
+      Requires the taginsights-lambda-signer profile and packages built with
+      package_lambdas.py --sign. Independent of Environment.
+
+  CurKmsKeyArn:
+    Type: String
+    Default: ""
+    AllowedPattern: "^(arn:[a-z-]+:kms:[a-z0-9-]+:[0-9]{12}:key/[A-Za-z0-9-]+)?$"
+    Description: >
+      KMS key that encrypts the CUR bucket (SSE-KMS), usually in the billing account.
+      When set, the cost allocator role gets kms:Decrypt on it through S3 only; the key
+      policy must also allow this role. Leave empty for SSE-S3.
+
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues: [DEBUG, INFO, WARNING, ERROR]
 
 Conditions:
-  IsDevOrTestEnvironment: !Or
-    - !Equals [!Ref Environment, "dev"]
-    - !Equals [!Ref Environment, "test"]
-    - !Equals [!Ref Environment, "staging"]
-
-  EnableAggressiveCleanup: !Or
-    - !Equals [!Ref Environment, "dev"]
-    - !Equals [!Ref Environment, "test"]
-    - !Equals [!Ref Environment, "staging"]
-
   # True when CUR database is explicitly configured
   HasCurDatabase: !Not [!Equals [!Ref CurDatabaseName, ""]]
   HasCurTable: !Not [!Equals [!Ref CurTableName, ""]]
   HasCurDatabaseAndTable: !And
     - !Condition HasCurDatabase
     - !Condition HasCurTable
-  HasCurAccountRole: !Not [!Equals [!Ref CurAccountRoleArn, ""]]
+  HasCurCatalog: !And
+    - !Not [!Equals [!Ref CurCatalogAccountId, ""]]
+    - !Condition HasCurDatabaseAndTable
+  HasCurKmsKey: !Not [!Equals [!Ref CurKmsKeyArn, ""]]
 
-  HasCurExternalId: !Not [!Equals [!Ref CurExternalId, ""]]
-
-
-  # Code signing enforced on prod only
-  IsProduction: !Equals [!Ref Environment, "prod"]
+  UseCodeSigning: !Equals [!Ref EnableCodeSigning, "true"]
 
 Resources:
-  # ============================================================================
-  # SQS QUEUE FOR COST ANALYSIS WORK
-  # ============================================================================
-
-  CostAnalysisWorkQueue:
-    Type: AWS::SQS::Queue
-    DeletionPolicy: !If [EnableAggressiveCleanup, Delete, Retain]
-    UpdateReplacePolicy: !If [EnableAggressiveCleanup, Delete, Retain]
+  CurDataCatalog:
+    Type: AWS::Athena::DataCatalog
+    Condition: HasCurCatalog
     Properties:
-      QueueName: !Sub "${ProjectName}-cost-analysis-work-${Environment}.fifo"
-      KmsMasterKeyId: alias/aws/sqs
-      FifoQueue: true
-      ContentBasedDeduplication: true
-      DeduplicationScope: messageGroup
-      FifoThroughputLimit: perMessageGroupId
-      # >= 6x the Worker timeout (300 s), per AWS guidance for SQS event sources,
-      # so a slow batch is never redelivered while still being processed.
-      VisibilityTimeout: 1800
-      MessageRetentionPeriod: 86400
-      ReceiveMessageWaitTimeSeconds: 20
-      RedrivePolicy:
-        deadLetterTargetArn: !GetAtt CostAnalysisDeadLetterQueue.Arn
-        maxReceiveCount: 3
-      Tags:
-        - Key: Project
-          Value: !Ref ProjectName
-        - Key: Environment
-          Value: !Ref Environment
-        - Key: Component
-          Value: CostAnalysisWorkQueue
-
-  CostAnalysisDeadLetterQueue:
-    Type: AWS::SQS::Queue
-    DeletionPolicy: !If [EnableAggressiveCleanup, Delete, Retain]
-    UpdateReplacePolicy: !If [EnableAggressiveCleanup, Delete, Retain]
-    Properties:
-      QueueName: !Sub "${ProjectName}-cost-analysis-dlq-${Environment}.fifo"
-      KmsMasterKeyId: alias/aws/sqs
-      FifoQueue: true
-      MessageRetentionPeriod: 1209600
+      Name: !Sub "${ProjectName}_cur_${Environment}"
+      Type: GLUE
+      Description: TagInsights - CUR Glue catalog in the billing account
+      Parameters:
+        catalog-id: !Ref CurCatalogAccountId
       Tags:
         - Key: Project
           Value: !Ref ProjectName
         - Key: Environment
           Value: !Ref Environment
 
-  # ============================================================================
-  # IAM ROLES
-  # ============================================================================
-
-  CostAnalyzerCoordinatorRole:
+  # Stateless, fixed-name resources use the default Delete policy: a retained
+  # role or function would block the next deployment with "already exists".
+  CostAllocatorRole:
     Type: AWS::IAM::Role
-    DeletionPolicy: !If [EnableAggressiveCleanup, Delete, Retain]
-    UpdateReplacePolicy: !If [EnableAggressiveCleanup, Delete, Retain]
     Properties:
-      RoleName: !Sub "${ProjectName}-cost-orches-${AWS::Region}-${Environment}"
+      RoleName: !Sub "${ProjectName}-cost-alloc-${AWS::Region}-${Environment}"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -185,288 +126,141 @@ Resources:
               StringEquals:
                 aws:SourceAccount: !Ref AWS::AccountId
       ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
       Policies:
-        - PolicyName: CostAnalyzerCoordinatorPolicy
+        - PolicyName: CostAllocatorPolicy
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
-              # Athena query execution
+              # Athena UNLOAD execution — TagInsights workgroup only
               - Effect: Allow
                 Action:
                   - athena:StartQueryExecution
                   - athena:GetQueryExecution
-                  - athena:GetQueryResults
                   - athena:StopQueryExecution
                   - athena:GetWorkGroup
                 Resource:
-                  - !Sub "arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/*"
+                  - !Sub
+                    - "arn:${AWS::Partition}:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${WorkgroupName}"
+                    - WorkgroupName: !ImportValue
+                        Fn::Sub: "ti-athena-workgroup-${Environment}"
 
-              # Glue access for querying tables
+              # Glue read — TagInsights analytics database (tag history tables)
               - Effect: Allow
                 Action:
                   - glue:GetDatabase
                   - glue:GetTable
                   - glue:GetPartitions
                 Resource:
-                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog"
                   - !Sub
-                    - "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${DatabaseName}"
+                    - "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${DatabaseName}"
                     - DatabaseName: !ImportValue
                         Fn::Sub: "ti-glue-database-${Environment}"
                   - !Sub
-                    - "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${DatabaseName}/*"
+                    - "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${DatabaseName}/*"
                     - DatabaseName: !ImportValue
                         Fn::Sub: "ti-glue-database-${Environment}"
 
-              # S3 access for central analytics bucket
-              - Effect: Allow
-                Action:
-                  - s3:GetObject
-                  - s3:PutObject
-                  - s3:ListBucket
-                Resource:
-                  - !Sub
-                    - "${BucketArn}"
-                    - BucketArn: !ImportValue
-                        Fn::Sub: "ti-central-analytics-bucket-arn-${Environment}"
-                  - !Sub
-                    - "${BucketArn}/*"
-                    - BucketArn: !ImportValue
-                        Fn::Sub: "ti-central-analytics-bucket-arn-${Environment}"
-
-              # S3 access for Athena results bucket
-              - Effect: Allow
-                Action:
-                  - s3:GetObject
-                  - s3:PutObject
-                  - s3:ListBucket
-                  - s3:GetBucketLocation
-                Resource:
-                  - !Sub "arn:aws:s3:::ti-athena-results-${AWS::Region}-${Environment}-${AWS::AccountId}"
-                  - !Sub "arn:aws:s3:::ti-athena-results-${AWS::Region}-${Environment}-${AWS::AccountId}/*"
-
-              # SQS send messages
-              - Effect: Allow
-                Action:
-                  - sqs:SendMessage
-                  - sqs:GetQueueUrl
-                  - sqs:GetQueueAttributes
-                Resource:
-                  - !GetAtt CostAnalysisWorkQueue.Arn
-
-              # CloudWatch metrics
-              - Effect: Allow
-                Action:
-                  - cloudwatch:PutMetricData
-                Resource: "*"
-
-  CostAnalyzerWorkerRole:
-    Type: AWS::IAM::Role
-    DeletionPolicy: !If [EnableAggressiveCleanup, Delete, Retain]
-    UpdateReplacePolicy: !If [EnableAggressiveCleanup, Delete, Retain]
-    Properties:
-      RoleName: !Sub "${ProjectName}-cost-worker-${AWS::Region}-${Environment}"
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
-            Condition:
-              StringEquals:
-                aws:SourceAccount: !Ref AWS::AccountId
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-      Policies:
-        - PolicyName: CostAnalyzerWorkerPolicy
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              # Athena query execution
-              - Effect: Allow
-                Action:
-                  - athena:StartQueryExecution
-                  - athena:GetQueryExecution
-                  - athena:GetQueryResults
-                  - athena:StopQueryExecution
-                  - athena:GetWorkGroup
-                Resource:
-                  - !Sub "arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/*"
-
-              # Glue access — TagInsights analytics database
-              - Effect: Allow
-                Action:
-                  - glue:GetDatabases
-                  - glue:GetDatabase
-                  - glue:GetTables
-                  - glue:GetTable
-                  - glue:GetPartitions
-                  - glue:CreatePartition
-                  - glue:BatchCreatePartition
-                Resource:
-                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog"
-                  - !Sub
-                    - "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${DatabaseName}"
-                    - DatabaseName: !ImportValue
-                        Fn::Sub: "ti-glue-database-${Environment}"
-                  - !Sub
-                    - "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${DatabaseName}/*"
-                    - DatabaseName: !ImportValue
-                        Fn::Sub: "ti-glue-database-${Environment}"
-
-              # Glue access — CUR database (scoped to the provided database and table only)
-              # Only added when both CurDatabaseName and CurTableName are specified
+              # Glue read — configured CUR database and table only (billing account's catalog when cross-account)
               - !If
                 - HasCurDatabaseAndTable
                 - Effect: Allow
                   Action:
-                    - glue:GetDatabases
                     - glue:GetDatabase
-                    - glue:GetTables
                     - glue:GetTable
+                    - glue:GetPartition
                     - glue:GetPartitions
                   Resource:
-                    - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog"
-                    - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${CurDatabaseName}"
-                    - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${CurDatabaseName}/${CurTableName}"
+                    - !Sub
+                      - "arn:${AWS::Partition}:glue:${AWS::Region}:${Owner}:catalog"
+                      - Owner: !If [HasCurCatalog, !Ref CurCatalogAccountId, !Ref AWS::AccountId]
+                    - !Sub
+                      - "arn:${AWS::Partition}:glue:${AWS::Region}:${Owner}:database/${CurDatabaseName}"
+                      - Owner: !If [HasCurCatalog, !Ref CurCatalogAccountId, !Ref AWS::AccountId]
+                    - !Sub
+                      - "arn:${AWS::Partition}:glue:${AWS::Region}:${Owner}:table/${CurDatabaseName}/${CurTableName}"
+                      - Owner: !If [HasCurCatalog, !Ref CurCatalogAccountId, !Ref AWS::AccountId]
                 - !Ref AWS::NoValue
 
-              # Cross-account CUR role assumption
               - !If
-                - HasCurAccountRole
+                - HasCurCatalog
                 - Effect: Allow
                   Action:
-                    - sts:AssumeRole
-                  Resource: !Ref CurAccountRoleArn
+                    - athena:GetDataCatalog
+                  Resource:
+                    - !Sub "arn:${AWS::Partition}:athena:${AWS::Region}:${AWS::AccountId}:datacatalog/${ProjectName}_cur_${Environment}"
                 - !Ref AWS::NoValue
 
-              # S3 access for central analytics bucket and CUR buckets
+              # S3 read — CUR data (Athena reads with the caller's credentials)
               - Effect: Allow
                 Action:
-                  - s3:GetObject
-                  - s3:PutObject
                   - s3:ListBucket
                 Resource:
-                  - !Sub
-                    - "${BucketArn}"
-                    - BucketArn: !ImportValue
-                        Fn::Sub: "ti-central-analytics-bucket-arn-${Environment}"
-                  - !Sub
-                    - "${BucketArn}/*"
-                    - BucketArn: !ImportValue
-                        Fn::Sub: "ti-central-analytics-bucket-arn-${Environment}"
-                  - !Sub "arn:aws:s3:::${CurBucketName}"
-                  - !Sub "arn:aws:s3:::${CurBucketName}/*"
-
-              # S3 access for Athena results bucket
+                  - !Sub "arn:${AWS::Partition}:s3:::${CurBucketName}"
               - Effect: Allow
                 Action:
                   - s3:GetObject
-                  - s3:PutObject
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${CurBucketName}/*"
+
+              # KMS decrypt for an SSE-KMS CUR bucket, only when S3 calls KMS on the role's behalf
+              - !If
+                - HasCurKmsKey
+                - Effect: Allow
+                  Action:
+                    - kms:Decrypt
+                  Resource:
+                    - !Ref CurKmsKeyArn
+                  Condition:
+                    StringEquals:
+                      kms:ViaService: !Sub "s3.${AWS::Region}.${AWS::URLSuffix}"
+                - !Ref AWS::NoValue
+
+              # S3 analytics bucket — list only the tag history and allocation prefixes
+              - Effect: Allow
+                Action:
                   - s3:ListBucket
+                Resource:
+                  - !ImportValue
+                    Fn::Sub: "ti-central-analytics-bucket-arn-${Environment}"
+                Condition:
+                  StringLike:
+                    s3:prefix:
+                      - "tag-deltas/*"
+                      - "tag-cost-allocation/*"
+                      - "tag-cost-allocation-staging/*"
+              - Effect: Allow
+                Action:
                   - s3:GetBucketLocation
                 Resource:
-                  - !Sub "arn:aws:s3:::ti-athena-results-${AWS::Region}-${Environment}-${AWS::AccountId}"
-                  - !Sub "arn:aws:s3:::ti-athena-results-${AWS::Region}-${Environment}-${AWS::AccountId}/*"
+                  - !ImportValue
+                    Fn::Sub: "ti-central-analytics-bucket-arn-${Environment}"
 
-              # Cost Explorer for cost allocation tags
+              # S3 analytics bucket — read tag history (SELECT source)
               - Effect: Allow
                 Action:
-                  - ce:ListCostAllocationTags
-                Resource: "*"
-
-              # SQS receive and delete messages
-              - Effect: Allow
-                Action:
-                  - sqs:ReceiveMessage
-                  - sqs:DeleteMessage
-                  - sqs:GetQueueAttributes
-                  - sqs:GetQueueUrl
+                  - s3:GetObject
                 Resource:
-                  - !GetAtt CostAnalysisWorkQueue.Arn
-                  - !GetAtt CostAnalysisDeadLetterQueue.Arn
-
-              # CloudWatch metrics
-              - Effect: Allow
-                Action:
-                  - cloudwatch:PutMetricData
-                Resource: "*"
-
-  CostDeduplicatorRole:
-    Type: AWS::IAM::Role
-    DeletionPolicy: !If [EnableAggressiveCleanup, Delete, Retain]
-    UpdateReplacePolicy: !If [EnableAggressiveCleanup, Delete, Retain]
-    Properties:
-      RoleName: !Sub "${ProjectName}-cost-dedup-${AWS::Region}-${Environment}"
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
-            Condition:
-              StringEquals:
-                aws:SourceAccount: !Ref AWS::AccountId
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-      Policies:
-        - PolicyName: CostDeduplicatorPolicy
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              # Athena query execution (for CTAS deduplication)
-              - Effect: Allow
-                Action:
-                  - athena:StartQueryExecution
-                  - athena:GetQueryExecution
-                  - athena:GetQueryResults
-                  - athena:StopQueryExecution
-                  - athena:GetWorkGroup
-                Resource:
-                  - !Sub "arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/*"
-
-              # Glue access for partition management and temporary table creation
-              - Effect: Allow
-                Action:
-                  - glue:GetDatabase
-                  - glue:GetTable
-                  - glue:CreateTable
-                  - glue:DeleteTable
-                  - glue:UpdateTable
-                  - glue:GetPartition
-                  - glue:GetPartitions
-                  - glue:CreatePartition
-                  - glue:BatchCreatePartition
-                  - glue:DeletePartition
-                  - glue:BatchDeletePartition
-                Resource:
-                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog"
                   - !Sub
-                    - "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${DatabaseName}"
-                    - DatabaseName: !ImportValue
-                        Fn::Sub: "ti-glue-database-${Environment}"
-                  - !Sub
-                    - "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${DatabaseName}/*"
-                    - DatabaseName: !ImportValue
-                        Fn::Sub: "ti-glue-database-${Environment}"
+                    - "${BucketArn}/tag-deltas/*"
+                    - BucketArn: !ImportValue
+                        Fn::Sub: "ti-central-analytics-bucket-arn-${Environment}"
 
-              # Full S3 access to central analytics bucket
+              # S3 analytics bucket — UNLOAD to the staging prefix, then replace the live month prefix
               - Effect: Allow
                 Action:
                   - s3:GetObject
                   - s3:PutObject
                   - s3:DeleteObject
-                  - s3:ListBucket
+                  - s3:AbortMultipartUpload
                 Resource:
                   - !Sub
-                    - "${BucketArn}"
+                    - "${BucketArn}/tag-cost-allocation/*"
                     - BucketArn: !ImportValue
                         Fn::Sub: "ti-central-analytics-bucket-arn-${Environment}"
                   - !Sub
-                    - "${BucketArn}/*"
+                    - "${BucketArn}/tag-cost-allocation-staging/*"
                     - BucketArn: !ImportValue
                         Fn::Sub: "ti-central-analytics-bucket-arn-${Environment}"
 
@@ -478,28 +272,22 @@ Resources:
                   - s3:ListBucket
                   - s3:GetBucketLocation
                 Resource:
-                  - !Sub "arn:aws:s3:::ti-athena-results-${AWS::Region}-${Environment}-${AWS::AccountId}"
-                  - !Sub "arn:aws:s3:::ti-athena-results-${AWS::Region}-${Environment}-${AWS::AccountId}/*"
-
-              # CloudWatch metrics
-              - Effect: Allow
-                Action:
-                  - cloudwatch:PutMetricData
-                Resource: "*"
+                  - !Sub "arn:${AWS::Partition}:s3:::ti-athena-results-${AWS::Region}-${Environment}-${AWS::AccountId}"
+                  - !Sub "arn:${AWS::Partition}:s3:::ti-athena-results-${AWS::Region}-${Environment}-${AWS::AccountId}/*"
 
   # ============================================================================
-  # LAMBDA CODE SIGNING (PRODUCTION ONLY)
+  # LAMBDA CODE SIGNING (EnableCodeSigning=true)
   # ONE-TIME SETUP: aws signer put-signing-profile --profile-name taginsights-lambda-signer --platform-id AWSLambda-SHA384-ECDSA
   # ============================================================================
 
   LambdaCodeSigningConfig:
     Type: AWS::Lambda::CodeSigningConfig
-    Condition: IsProduction
+    Condition: UseCodeSigning
     Properties:
       Description: !Sub "TagInsights Lambda code signing enforcement — ${Environment}"
       AllowedPublishers:
         SigningProfileVersionArns:
-          - !Sub "arn:aws:signer:${AWS::Region}:${AWS::AccountId}:/signing-profiles/taginsights-lambda-signer"
+          - !Sub "arn:${AWS::Partition}:signer:${AWS::Region}:${AWS::AccountId}:/signing-profiles/taginsights-lambda-signer"
       CodeSigningPolicies:
         UntrustedArtifactOnDeployment: Enforce
       Tags:
@@ -514,70 +302,22 @@ Resources:
   # LAMBDA FUNCTIONS
   # ============================================================================
 
-  CostAnalyzerCoordinatorLambda:
+  CostAllocatorLambda:
     Type: AWS::Lambda::Function
-    DeletionPolicy: !If [EnableAggressiveCleanup, Delete, Retain]
-    UpdateReplacePolicy: !If [EnableAggressiveCleanup, Delete, Retain]
     Properties:
-      FunctionName: !Sub "${ProjectName}-cost-orches-${Environment}-${AWS::AccountId}"
-      Runtime: python3.11
+      FunctionName: !Sub "${ProjectName}-cost-alloc-${Environment}-${AWS::AccountId}"
+      Runtime: python3.14
       Handler: index.lambda_handler
-      Role: !GetAtt CostAnalyzerCoordinatorRole.Arn
+      Role: !GetAtt CostAllocatorRole.Arn
       Timeout: 900
       MemorySize: 512
+      # One run at a time: concurrent runs would race on replacing the same month prefix.
+      ReservedConcurrentExecutions: 1
       Environment:
         Variables:
           PROJECT_NAME: !Ref ProjectName
           ENVIRONMENT: !Ref Environment
           HUB_REGION: !Ref AWS::Region
-          CENTRAL_ANALYTICS_BUCKET: !ImportValue
-            Fn::Sub: "ti-central-analytics-bucket-${Environment}"
-          ATHENA_OUTPUT_BUCKET: !Sub "ti-athena-results-${AWS::Region}-${Environment}-${AWS::AccountId}"
-          ATHENA_DATABASE: !ImportValue
-            Fn::Sub: "ti-glue-database-${Environment}"
-          ATHENA_WORKGROUP: !ImportValue
-            Fn::Sub: "ti-athena-workgroup-${Environment}"
-          COST_ANALYSIS_QUEUE_URL: !Ref CostAnalysisWorkQueue
-          BATCH_SIZE: "100"
-          LOG_LEVEL: INFO
-      CodeSigningConfigArn:
-        !If [IsProduction, !Ref LambdaCodeSigningConfig, !Ref AWS::NoValue]
-      Code:
-        S3Bucket: !Ref LambdaCodeBucket
-        S3Key: !If
-          - IsProduction
-          - !Sub "signed/v${DeploymentVersion}/cost_analyzer_coordinator.zip"
-          - !Sub "lambda-packages/v${DeploymentVersion}/cost_analyzer_coordinator.zip"
-      Tags:
-        - Key: Project
-          Value: !Ref ProjectName
-        - Key: Environment
-          Value: !Ref Environment
-        - Key: Component
-          Value: CostAnalyzerCoordinator
-
-  CostAnalyzerWorkerLambda:
-    Type: AWS::Lambda::Function
-    DeletionPolicy: !If [EnableAggressiveCleanup, Delete, Retain]
-    UpdateReplacePolicy: !If [EnableAggressiveCleanup, Delete, Retain]
-    Properties:
-      FunctionName: !Sub "${ProjectName}-cost-worker-${Environment}-${AWS::AccountId}"
-      Runtime: python3.11
-      Handler: index.lambda_handler
-      Role: !GetAtt CostAnalyzerWorkerRole.Arn
-      Timeout: 300
-      MemorySize: 512
-      ReservedConcurrentExecutions: 10
-      Layers:
-        # AWS-managed layer with pandas, numpy, pyarrow for Parquet operations
-        - !Sub "arn:aws:lambda:${AWS::Region}:336392948345:layer:AWSSDKPandas-Python311:13"
-      Environment:
-        Variables:
-          PROJECT_NAME: !Ref ProjectName
-          ENVIRONMENT: !Ref Environment
-          HUB_REGION: !Ref AWS::Region
-          S3_BUCKET: !ImportValue
-            Fn::Sub: "ti-central-analytics-bucket-${Environment}"
           CENTRAL_ANALYTICS_BUCKET: !ImportValue
             Fn::Sub: "ti-central-analytics-bucket-${Environment}"
           ATHENA_DATABASE: !ImportValue
@@ -585,254 +325,77 @@ Resources:
           ATHENA_WORKGROUP: !ImportValue
             Fn::Sub: "ti-athena-workgroup-${Environment}"
           ATHENA_RESULTS_BUCKET: !Sub "ti-athena-results-${AWS::Region}-${Environment}-${AWS::AccountId}"
-          # CUR integration — set when both database and table are provided
           CUR_ATHENA_DATABASE: !If [HasCurDatabaseAndTable, !Ref CurDatabaseName, ""]
           CUR_ATHENA_TABLE: !If [HasCurDatabaseAndTable, !Ref CurTableName, ""]
-          CUR_ACCOUNT_ROLE_ARN: !Ref CurAccountRoleArn
-          CUR_EXTERNAL_ID: !If [HasCurExternalId, !Ref CurExternalId, ""]
-          CUR_ATHENA_RESULTS_BUCKET: !Ref CurAthenaResultsBucket
-          # Cost Explorer fallback — disabled by default to prevent unexpected charges.
-          # Set EnableCostExplorerFallback=true to allow fallback when CUR is unavailable.
-          ENABLE_COST_EXPLORER_FALLBACK: !Ref EnableCostExplorerFallback
-          LOG_LEVEL: INFO
+          # Cross-account CUR is read through CurDataCatalog.
+          CUR_DATA_CATALOG: !If [HasCurCatalog, !Ref CurDataCatalog, ""]
+          CUR_CATALOG_ID: !If [HasCurCatalog, !Ref CurCatalogAccountId, ""]
+          LOG_LEVEL: !Ref LogLevel
       CodeSigningConfigArn:
-        !If [IsProduction, !Ref LambdaCodeSigningConfig, !Ref AWS::NoValue]
+        !If [UseCodeSigning, !Ref LambdaCodeSigningConfig, !Ref AWS::NoValue]
       Code:
         S3Bucket: !Ref LambdaCodeBucket
         S3Key: !If
-          - IsProduction
-          - !Sub "signed/v${DeploymentVersion}/cost_analyzer_worker.zip"
-          - !Sub "lambda-packages/v${DeploymentVersion}/cost_analyzer_worker.zip"
+          - UseCodeSigning
+          - !Sub "signed/v${DeploymentVersion}/cost_allocator.zip"
+          - !Sub "lambda-packages/v${DeploymentVersion}/cost_allocator.zip"
       Tags:
         - Key: Project
           Value: !Ref ProjectName
         - Key: Environment
           Value: !Ref Environment
         - Key: Component
-          Value: CostAnalyzerWorker
+          Value: CostAllocator
 
-  CostDeduplicatorLambda:
-    Type: AWS::Lambda::Function
-    DeletionPolicy: !If [EnableAggressiveCleanup, Delete, Retain]
-    UpdateReplacePolicy: !If [EnableAggressiveCleanup, Delete, Retain]
-    Properties:
-      FunctionName: !Sub "${ProjectName}-cost-dedup-${Environment}-${AWS::AccountId}"
-      Runtime: python3.11
-      Handler: index.lambda_handler
-      Role: !GetAtt CostDeduplicatorRole.Arn
-      Timeout: 900
-      MemorySize: 1024
-      Environment:
-        Variables:
-          PROJECT_NAME: !Ref ProjectName
-          ENVIRONMENT: !Ref Environment
-          HUB_REGION: !Ref AWS::Region
-          S3_BUCKET: !ImportValue
-            Fn::Sub: "ti-central-analytics-bucket-${Environment}"
-          CENTRAL_ANALYTICS_BUCKET: !ImportValue
-            Fn::Sub: "ti-central-analytics-bucket-${Environment}"
-          ATHENA_DATABASE: !ImportValue
-            Fn::Sub: "ti-glue-database-${Environment}"
-          ATHENA_WORKGROUP: !ImportValue
-            Fn::Sub: "ti-athena-workgroup-${Environment}"
-          LOG_LEVEL: INFO
-      CodeSigningConfigArn:
-        !If [IsProduction, !Ref LambdaCodeSigningConfig, !Ref AWS::NoValue]
-      Code:
-        S3Bucket: !Ref LambdaCodeBucket
-        S3Key: !If
-          - IsProduction
-          - !Sub "signed/v${DeploymentVersion}/cost_deduplicator.zip"
-          - !Sub "lambda-packages/v${DeploymentVersion}/cost_deduplicator.zip"
-      Tags:
-        - Key: Project
-          Value: !Ref ProjectName
-        - Key: Environment
-          Value: !Ref Environment
-        - Key: Component
-          Value: CostDeduplicator
-
-  # ============================================================================
-  # LAMBDA EVENT SOURCE MAPPING
-  # ============================================================================
-
-  CostAnalyzerWorkerEventMapping:
-    Type: AWS::Lambda::EventSourceMapping
-    Properties:
-      EventSourceArn: !GetAtt CostAnalysisWorkQueue.Arn
-      FunctionName: !Ref CostAnalyzerWorkerLambda
-      BatchSize: 5
-      Enabled: true
-      ScalingConfig:
-        MaximumConcurrency: 10
-
-  # ============================================================================
-  # EVENTBRIDGE SCHEDULES
-  # ============================================================================
-
-  CostAnalysisSchedule:
+  CostAllocationSchedule:
     Type: AWS::Events::Rule
     Properties:
-      Name: !Sub "${ProjectName}-cost-analysis-${Environment}"
-      Description: "Run cost analysis every 12 hours"
+      Name: !Sub "${ProjectName}-cost-alloc-${Environment}"
+      Description: "Recompute set-based tag cost allocation daily (current and previous month)"
       State: ENABLED
-      ScheduleExpression: !Ref CostAnalysisScheduleExpression
+      ScheduleExpression: "cron(0 6 * * ? *)"
       Targets:
-        - Arn: !GetAtt CostAnalyzerCoordinatorLambda.Arn
-          Id: CostAnalyzerCoordinatorTarget
+        - Arn: !GetAtt CostAllocatorLambda.Arn
+          Id: CostAllocatorTarget
           Input: |
             {
-              "trigger_source": "scheduled",
-              "lookback_hours": 12
+              "trigger_source": "scheduled"
             }
 
-  CostAnalysisSchedulePermission:
+  CostAllocationSchedulePermission:
     Type: AWS::Lambda::Permission
     Properties:
-      FunctionName: !Ref CostAnalyzerCoordinatorLambda
+      FunctionName: !Ref CostAllocatorLambda
       Action: lambda:InvokeFunction
       Principal: events.amazonaws.com
       SourceAccount: !Ref AWS::AccountId
-      SourceArn: !GetAtt CostAnalysisSchedule.Arn
+      SourceArn: !GetAtt CostAllocationSchedule.Arn
 
   # ============================================================================
   # CLOUDWATCH ALARMS
   # ============================================================================
 
-  QueueEmptyAlarm:
+  CostAllocatorErrorAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
-      AlarmName: !Sub "${ProjectName}-cost-queue-empty-${Environment}"
-      AlarmDescription: "Trigger deduplication when cost analysis queue is empty"
-      MetricName: ApproximateNumberOfMessagesVisible
-      Namespace: AWS/SQS
-      Statistic: Average
-      Period: 300
-      EvaluationPeriods: 2
-      Threshold: 0
-      ComparisonOperator: LessThanOrEqualToThreshold
-      Dimensions:
-        - Name: QueueName
-          Value: !GetAtt CostAnalysisWorkQueue.QueueName
-      AlarmActions:
-        - !Ref DeduplicationTopic
-      TreatMissingData: notBreaching
-
-  DeadLetterQueueAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub "${ProjectName}-cost-dlq-messages-${Environment}"
-      AlarmDescription: "Alert when messages in cost analysis DLQ"
-      MetricName: ApproximateNumberOfMessagesVisible
-      Namespace: AWS/SQS
+      AlarmName: !Sub "${ProjectName}-cost-allocator-errors-${Environment}"
+      AlarmDescription: "Daily cost allocation failed"
+      MetricName: Errors
+      Namespace: AWS/Lambda
       Statistic: Sum
-      Period: 300
+      Period: 3600
       EvaluationPeriods: 1
       Threshold: 1
       ComparisonOperator: GreaterThanOrEqualToThreshold
       Dimensions:
-        - Name: QueueName
-          Value: !GetAtt CostAnalysisDeadLetterQueue.QueueName
-      TreatMissingData: notBreaching
-
-  CoordinatorErrorAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub "${ProjectName}-cost-orches-errors-${Environment}"
-      AlarmDescription: "Alert on cost orches errors"
-      MetricName: Errors
-      Namespace: AWS/Lambda
-      Statistic: Sum
-      Period: 300
-      EvaluationPeriods: 2
-      Threshold: 5
-      ComparisonOperator: GreaterThanOrEqualToThreshold
-      Dimensions:
         - Name: FunctionName
-          Value: !Ref CostAnalyzerCoordinatorLambda
+          Value: !Ref CostAllocatorLambda
       TreatMissingData: notBreaching
 
-  WorkerErrorAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub "${ProjectName}-cost-worker-errors-${Environment}"
-      AlarmDescription: "Alert on cost worker errors"
-      MetricName: Errors
-      Namespace: AWS/Lambda
-      Statistic: Sum
-      Period: 300
-      EvaluationPeriods: 2
-      Threshold: 10
-      ComparisonOperator: GreaterThanOrEqualToThreshold
-      Dimensions:
-        - Name: FunctionName
-          Value: !Ref CostAnalyzerWorkerLambda
-      TreatMissingData: notBreaching
-
-  # ============================================================================
-  # SNS TOPIC FOR DEDUPLICATION TRIGGER
-  # ============================================================================
-
-  DeduplicationTopic:
-    Type: AWS::SNS::Topic
-    Properties:
-      TopicName: !Sub "${ProjectName}-cost-dedup-trigger-${Environment}"
-      # Publisher is a CloudWatch alarm, so the AWS managed SNS key won't work.
-      KmsMasterKeyId: !ImportValue
-        Fn::Sub: "ti-messaging-key-arn-${Environment}"
-      DisplayName: "Cost Analysis Deduplication Trigger"
-      Tags:
-        - Key: Project
-          Value: !Ref ProjectName
-        - Key: Environment
-          Value: !Ref Environment
-
-  DeduplicationTopicSubscription:
-    Type: AWS::SNS::Subscription
-    Properties:
-      Protocol: lambda
-      TopicArn: !Ref DeduplicationTopic
-      Endpoint: !GetAtt CostDeduplicatorLambda.Arn
-
-  DeduplicationTopicPermission:
-    Type: AWS::Lambda::Permission
-    Properties:
-      FunctionName: !Ref CostDeduplicatorLambda
-      Action: lambda:InvokeFunction
-      Principal: sns.amazonaws.com
-      SourceAccount: !Ref AWS::AccountId
-      SourceArn: !Ref DeduplicationTopic
-
-  # ============================================================================
-  # CLOUDWATCH LOG GROUPS
-  # ============================================================================
-
-  CoordinatorLogGroup:
+  CostAllocatorLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: !Sub "/aws/lambda/${CostAnalyzerCoordinatorLambda}"
-      RetentionInDays: 14
-      Tags:
-        - Key: Project
-          Value: !Ref ProjectName
-        - Key: Environment
-          Value: !Ref Environment
-
-  WorkerLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub "/aws/lambda/${CostAnalyzerWorkerLambda}"
-      RetentionInDays: 14
-      Tags:
-        - Key: Project
-          Value: !Ref ProjectName
-        - Key: Environment
-          Value: !Ref Environment
-
-  DeduplicatorLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub "/aws/lambda/${CostDeduplicatorLambda}"
+      LogGroupName: !Sub "/aws/lambda/${CostAllocatorLambda}"
       RetentionInDays: 30
       Tags:
         - Key: Project
@@ -840,49 +403,77 @@ Resources:
         - Key: Environment
           Value: !Ref Environment
 
+  # ============================================================================
+  # SET-BASED TAG COST ALLOCATION TABLE
+  # Written by CostAllocatorLambda via Athena UNLOAD; partition projection means
+  # no partition registration is needed.
+  # ============================================================================
+
+  TagCostAllocationTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !ImportValue
+        Fn::Sub: "ti-glue-database-${Environment}"
+      TableInput:
+        Name: tag_cost_allocation
+        Description: "Set-based tag cost allocation (daily cost per resource and tag), partitioned by year/month"
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: parquet
+          "parquet.compression": SNAPPY
+          projection.enabled: "true"
+          projection.year.type: integer
+          projection.year.range: "2020,2100"
+          projection.month.type: integer
+          projection.month.range: "1,12"
+          storage.location.template: !Sub
+            - "s3://${Bucket}/tag-cost-allocation/year=${!year}/month=${!month}/"
+            - Bucket: !ImportValue
+                Fn::Sub: "ti-central-analytics-bucket-${Environment}"
+        StorageDescriptor:
+          Location: !Sub
+            - "s3://${Bucket}/tag-cost-allocation/"
+            - Bucket: !ImportValue
+                Fn::Sub: "ti-central-analytics-bucket-${Environment}"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+            Parameters:
+              serialization.format: "1"
+          Columns:
+            - Name: account_id
+              Type: string
+            - Name: resource_arn
+              Type: string
+            - Name: resource_type
+              Type: string
+            - Name: region
+              Type: string
+            - Name: usage_date
+              Type: date
+            - Name: tag_key
+              Type: string
+            - Name: tag_value
+              Type: string
+            - Name: tags_assumed
+              Type: boolean
+            - Name: cost
+              Type: double
+        PartitionKeys:
+          - Name: year
+            Type: int
+          - Name: month
+            Type: int
+
 # ============================================================================
 # OUTPUTS
 # ============================================================================
 
 Outputs:
-  CostAnalysisWorkQueueUrl:
-    Description: Cost analysis work queue URL
-    Value: !Ref CostAnalysisWorkQueue
+  CostAllocatorLambdaArn:
+    Description: Cost Allocator Lambda ARN
+    Value: !GetAtt CostAllocatorLambda.Arn
     Export:
-      Name: !Sub "${ProjectName}-cost-work-queue-url-${Environment}"
-
-  CostAnalysisWorkQueueArn:
-    Description: Cost analysis work queue ARN
-    Value: !GetAtt CostAnalysisWorkQueue.Arn
-    Export:
-      Name: !Sub "${ProjectName}-cost-work-queue-arn-${Environment}"
-
-  CostAnalysisDeadLetterQueueUrl:
-    Description: Cost analysis DLQ URL
-    Value: !Ref CostAnalysisDeadLetterQueue
-    Export:
-      Name: !Sub "${ProjectName}-cost-dlq-url-${Environment}"
-
-  CoordinatorLambdaArn:
-    Description: Cost Analyzer Coordinator Lambda ARN
-    Value: !GetAtt CostAnalyzerCoordinatorLambda.Arn
-    Export:
-      Name: !Sub "${ProjectName}-cost-orches-lambda-${Environment}"
-
-  WorkerLambdaArn:
-    Description: Cost Analyzer Worker Lambda ARN
-    Value: !GetAtt CostAnalyzerWorkerLambda.Arn
-    Export:
-      Name: !Sub "${ProjectName}-cost-worker-lambda-${Environment}"
-
-  DeduplicatorLambdaArn:
-    Description: Cost Deduplicator Lambda ARN
-    Value: !GetAtt CostDeduplicatorLambda.Arn
-    Export:
-      Name: !Sub "${ProjectName}-cost-dedup-lambda-${Environment}"
-
-  AnalysisSchedule:
-    Description: Cost analysis schedule expression
-    Value: !Ref CostAnalysisSchedule
-    Export:
-      Name: !Sub "${ProjectName}-cost-schedule-${Environment}"
+      Name: !Sub "${ProjectName}-cost-alloc-lambda-${Environment}"

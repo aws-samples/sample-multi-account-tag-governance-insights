@@ -17,15 +17,17 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 # ── Fixtures & helpers ────────────────────────────────────────────────────────
 
+CHECKPOINT_ARN = "arn:aws:secretsmanager:us-east-1:123456789012:secret:ti-checkpoint-AbCdEf"
 ENV_VARS = {
     "ENVIRONMENT": "test",
     "HUB_REGION": "us-east-1",
-    "CENTRAL_ANALYTICS_BUCKET": "test-analytics-bucket",
+    "CENTRAL_ANALYTICS_BUCKET": "amzn-s3-demo-analytics-bucket",
     "WORKER_FUNCTION_NAME": "test-worker-function",
     "MAX_SCAN_DAYS": "3",
-    "CHECKPOINT_SIGNING_SECRET": "deadbeef" * 8,
+    "CHECKPOINT_SECRET_ARN": CHECKPOINT_ARN,
     "LOG_LEVEL": "WARNING",
 }
+TEST_HMAC_KEY = "deadbeef" * 8
 
 
 class NoSuchKey(Exception):
@@ -83,8 +85,8 @@ def _import_module(s3_mock=None, lambda_mock=None):
             # Patch module-level clients
             mod.s3 = s3
             mod.lambda_client = lam
-            # Reset the cached signing secret so it re-reads from env
-            mod._cached_signing_secret = None
+            # Pre-seed the per-container cache so tests make no Secrets Manager call
+            mod._cached_signing_secret = TEST_HMAC_KEY
             return mod
 
 
@@ -122,6 +124,60 @@ class TestCheckpointSignature:
         mod = _import_module()
         checkpoint = {"scan_id": "2026-01-01", "completed": []}
         assert mod._validate_checkpoint_signature(checkpoint) is False
+
+
+class TestSigningSecretFromSecretsManager:
+    """The HMAC key comes from Secrets Manager, never a Lambda env var."""
+
+    ARN = ENV_VARS["CHECKPOINT_SECRET_ARN"]
+
+    def _stubbed(self, mod):
+        import boto3 as real_boto3
+        from botocore.stub import Stubber
+
+        mod._cached_signing_secret = None
+        with patch.dict(os.environ):
+            # A profile named in the shell would not exist under AWS_CONFIG_FILE=/dev/null.
+            os.environ.pop("AWS_PROFILE", None)
+            os.environ.pop("AWS_DEFAULT_PROFILE", None)
+            client = real_boto3.session.Session().client("secretsmanager", region_name="us-east-1")
+        return client, Stubber(client)
+
+    def test_reads_secret_once_per_container(self):
+        mod = _import_module()
+        client, stub = self._stubbed(mod)
+        stub.add_response(
+            "get_secret_value",
+            {"ARN": self.ARN, "Name": "ti-checkpoint", "SecretString": TEST_HMAC_KEY},
+            {"SecretId": self.ARN},
+        )
+        with stub, patch("boto3.client", return_value=client) as factory:
+            assert mod._checkpoint_signature_secret() == TEST_HMAC_KEY
+            sig = mod._generate_checkpoint_signature({"scan_id": "2026-01-01"})
+            assert mod._validate_checkpoint_signature({"scan_id": "2026-01-01", "signature": sig})
+            stub.assert_no_pending_responses()
+        assert factory.call_args_list == [(("secretsmanager",), {})]
+
+    def test_env_var_path_removed_and_missing_arn_raises(self):
+        mod = _import_module()
+        mod._cached_signing_secret = None
+        env = {k: v for k, v in ENV_VARS.items() if k != "CHECKPOINT_SECRET_ARN"}
+        env["CHECKPOINT_SIGNING_SECRET"] = TEST_HMAC_KEY
+        with patch.dict(os.environ, env, clear=True), patch("boto3.client") as factory:
+            with pytest.raises(RuntimeError, match="CHECKPOINT_SECRET_ARN"):
+                mod._checkpoint_signature_secret()
+        factory.assert_not_called()
+
+    def test_read_failure_stops_handler_before_scanning(self):
+        mod = _import_module()
+        client, stub = self._stubbed(mod)
+        stub.add_client_error("get_secret_value", service_error_code="AccessDeniedException")
+        with stub, patch("boto3.client", return_value=client):
+            with pytest.raises(RuntimeError, match="AccessDeniedException"):
+                mod.lambda_handler({}, _make_context())
+        assert mod._cached_signing_secret is None
+        mod.s3.get_object.assert_not_called()
+        mod.lambda_client.invoke.assert_not_called()
 
 
 class TestReadCheckpoint:
@@ -164,6 +220,15 @@ class TestReadCheckpoint:
         assert result["scan_id"] == "2026-06-01"
 
 
+    def test_other_read_errors_propagate(self):
+        # Returning None here would start a new cycle and overwrite progress.
+        s3 = _make_s3_mock()
+        s3.get_object.side_effect = RuntimeError("SlowDown")
+        mod = _import_module(s3_mock=s3)
+        with pytest.raises(RuntimeError, match="SlowDown"):
+            mod.read_checkpoint()
+
+
 class TestWriteCheckpoint:
     def test_write_calls_put_object(self):
         s3 = _make_s3_mock()
@@ -177,7 +242,7 @@ class TestWriteCheckpoint:
         mod.write_checkpoint(cp)
         s3.put_object.assert_called_once()
         call_kwargs = s3.put_object.call_args[1]
-        assert call_kwargs["Bucket"] == "test-analytics-bucket"
+        assert call_kwargs["Bucket"] == "amzn-s3-demo-analytics-bucket"
         body = json.loads(call_kwargs["Body"])
         assert "signature" in body
 
@@ -219,36 +284,54 @@ class TestDiscoverAccounts:
         assert "222222222222" in accounts
         assert "333333333333" not in accounts
 
-    def test_discover_accounts_falls_back_to_re(self):
-        s3 = _make_s3_mock()
-        mod = _import_module(s3_mock=s3)
+    def test_discover_accounts_fails_loudly_without_org_access(self):
+        mod = _import_module()
 
         from botocore.exceptions import ClientError
 
         error_resp = {"Error": {"Code": "AccessDeniedException", "Message": "denied"}}
+        orgs = MagicMock()
+        orgs.get_paginator.side_effect = ClientError(error_resp, "ListAccounts")
 
-        mock_re = MagicMock()
-        mock_re.list_indexes.return_value = {
-            "Indexes": [
-                {
-                    "Arn": "arn:aws:resource-explorer-2:us-east-1:444444444444:index/local"
-                },
-            ]
-        }
+        with patch("boto3.client", return_value=orgs):
+            with pytest.raises(RuntimeError, match="delegated administrator"):
+                mod.discover_accounts()
 
-        def client_factory(service, **kwargs):
-            if service == "organizations":
-                m = MagicMock()
-                m.get_paginator.side_effect = ClientError(error_resp, "ListAccounts")
-                return m
-            if service == "resource-explorer-2":
-                return mock_re
-            return MagicMock()
+    def test_region_list_paginates_list_indexes(self):
+        mod = _import_module()
+        re_client = MagicMock()
+        re_client.get_paginator.return_value.paginate.return_value = [
+            {"Indexes": [{"Arn": "arn:aws:resource-explorer-2:us-east-1:111122223333:index/a"}]},
+            {"Indexes": [{"Arn": "arn:aws:resource-explorer-2:eu-west-1:111122223333:index/b"}]},
+        ]
+        with patch("boto3.client", return_value=re_client):
+            pairs = mod.build_account_region_list(["111122223333"])
+        assert pairs == [("111122223333", "us-east-1"), ("111122223333", "eu-west-1"),
+                         ("111122223333", "global")]
 
-        with patch("boto3.client", side_effect=client_factory):
-            accounts = mod.discover_accounts()
+    def test_region_list_includes_global(self):
+        # Global resources (IAM, CloudFront, Route 53) only match region:global:
+        # https://docs.aws.amazon.com/resource-explorer/latest/userguide/using-search-query-syntax.html
+        mod = _import_module()
+        re_client = MagicMock()
+        re_client.get_paginator.return_value.paginate.return_value = [
+            {"Indexes": [{"Arn": "arn:aws:resource-explorer-2:us-east-1:111122223333:index/a"}]},
+        ]
+        with patch("boto3.client", return_value=re_client):
+            pairs = mod.build_account_region_list(["111122223333"])
+        assert ("111122223333", "global") in pairs
+        assert pairs.count(("111122223333", "global")) == 1
 
-        assert "444444444444" in accounts
+    def test_region_list_error_is_not_hidden(self):
+        """G4: a ListIndexes failure must not shrink the cycle to the hub Region."""
+        from botocore.exceptions import ClientError
+        mod = _import_module()
+        re_client = MagicMock()
+        re_client.get_paginator.return_value.paginate.side_effect = ClientError(
+            {"Error": {"Code": "ThrottlingException", "Message": "slow down"}}, "ListIndexes")
+        with patch("boto3.client", return_value=re_client):
+            with pytest.raises(ClientError):
+                mod.build_account_region_list(["123456789012"])
 
 
 # ── Worker invocation tests ───────────────────────────────────────────────────
@@ -364,6 +447,51 @@ class TestSequentialScan:
         assert lam.invoke.call_count == 1
 
 
+    def test_checkpoint_written_only_after_successful_pairs(self):
+        s3 = _make_s3_mock()
+        lam = MagicMock()
+        lam.invoke.side_effect = Exception("boom")
+        mod = _import_module(s3_mock=s3, lambda_mock=lam)
+        pairs = [(f"{i:012d}", "us-east-1") for i in range(150)]
+        checkpoint = {"completed": [], "completed_count": 0, "total_count": 150,
+                      "errors": [], "last_updated": ""}
+
+        result = mod.sequential_scan(pairs, checkpoint, "scan-1", _make_context())
+
+        # Every pair failed: only the final save happens, and errors are capped.
+        assert s3.put_object.call_count == 1
+        assert len(result["errors"]) == mod.MAX_CHECKPOINT_ERRORS
+        assert result["errors"][-1]["pair"] == "000000000149/us-east-1"
+
+    def test_successful_retry_clears_earlier_errors(self):
+        s3 = _make_s3_mock()
+        lam = MagicMock()
+        lam.invoke.return_value = {"StatusCode": 200, "Payload": MagicMock()}
+        mod = _import_module(s3_mock=s3, lambda_mock=lam)
+        pairs = [("111", "us-east-1")]
+        checkpoint = {"completed": [], "completed_count": 0, "total_count": 1,
+                      "errors": [{"pair": "111/us-east-1", "timestamp": "t"},
+                                 {"pair": "222/us-west-2", "timestamp": "t"}],
+                      "last_updated": ""}
+
+        result = mod.sequential_scan(pairs, checkpoint, "scan-1", _make_context())
+
+        assert result["errors"] == [{"pair": "222/us-west-2", "timestamp": "t"}]
+
+
+class TestLambdaClientConfig:
+    def test_sync_invoke_does_not_time_out_or_retry_before_worker(self):
+        with patch.dict(os.environ, ENV_VARS), patch("boto3.client") as client:
+            import lambda_handlers.aggregator_coordinator  # noqa: F401
+        lambda_calls = [c for c in client.call_args_list if c.args[0] == "lambda"]
+        assert len(lambda_calls) == 1
+        kwargs = lambda_calls[0].kwargs
+        assert "region_name" not in kwargs
+        config = kwargs["config"]
+        assert config.read_timeout == 900
+        assert config.retries["max_attempts"] == 0
+
+
 # ── Fan-out scan tests ────────────────────────────────────────────────────────
 
 
@@ -466,3 +594,159 @@ class TestLambdaHandler:
                 result = mod.lambda_handler({"trigger_source": "test"}, _make_context())
 
         assert result["status"] == "fanout_dispatched"
+        # Cycle is closed: completion marker written and checkpoint removed,
+        # so the next run starts a new cycle instead of fanning out again.
+        marker = [c.kwargs for c in s3.put_object.call_args_list
+                  if c.kwargs["Key"].startswith(mod.COMPLETION_KEY_PREFIX)]
+        assert len(marker) == 1
+        assert json.loads(marker[0]["Body"])["mode"] == "fanout"
+        assert all(c.kwargs["Key"] != mod.CHECKPOINT_KEY for c in s3.put_object.call_args_list)
+        s3.delete_object.assert_called_once_with(
+            Bucket="amzn-s3-demo-analytics-bucket", Key=mod.CHECKPOINT_KEY
+        )
+
+    def test_run_after_fanout_starts_fresh_cycle_instead_of_fanning_out_again(self):
+        """B5: the invocation AFTER a fan-out must not re-fan the same pairs."""
+        store = {}
+        s3 = _make_s3_mock()
+
+        def get_object(Bucket, Key):
+            if Key not in store:
+                raise NoSuchKey()
+            body = store[Key]
+            return {"Body": MagicMock(read=lambda: body)}
+
+        def put_object(Bucket, Key, Body, **kwargs):
+            store[Key] = Body.encode() if isinstance(Body, str) else Body
+
+        s3.get_object.side_effect = get_object
+        s3.put_object.side_effect = put_object
+        s3.delete_object.side_effect = lambda Bucket, Key: store.pop(Key, None)
+
+        lam = MagicMock()
+        lam.invoke.side_effect = lambda **kw: {
+            "StatusCode": 202 if kw["InvocationType"] == "Event" else 200
+        }
+        mod = _import_module(s3_mock=s3, lambda_mock=lam)
+
+        old_start = (datetime.utcnow() - timedelta(days=5)).isoformat()
+        cp = {
+            "scan_id": "2026-06-10", "started_at": old_start, "completed": [],
+            "completed_count": 0, "total_count": 2, "errors": [],
+            "last_updated": old_start,
+        }
+        cp["signature"] = mod._generate_checkpoint_signature(cp)
+        store[mod.CHECKPOINT_KEY] = json.dumps(cp).encode()
+
+        pairs = [("111", "us-east-1"), ("222", "us-west-2")]
+        with patch.object(mod, "discover_accounts", return_value=["111", "222"]), \
+                patch.object(mod, "build_account_region_list", return_value=pairs):
+            first = mod.lambda_handler({"trigger_source": "test"}, _make_context())
+            async_after_first = [c for c in lam.invoke.call_args_list
+                                 if c.kwargs["InvocationType"] == "Event"]
+            second = mod.lambda_handler({"trigger_source": "test"}, _make_context())
+
+        assert first["status"] == "fanout_dispatched"
+        assert len(async_after_first) == 2
+        # Second run: fresh cycle, sequential scan, no second fan-out.
+        assert second["status"] == "complete"
+        assert second["scan_id"] != "2026-06-10"
+        async_total = [c for c in lam.invoke.call_args_list
+                       if c.kwargs["InvocationType"] == "Event"]
+        assert len(async_total) == 2
+
+
+class TestFanoutTimeout:
+    """G3: a fan-out that runs out of time must checkpoint, not redo itself daily."""
+
+    def test_fanout_stops_before_timeout_and_resumes(self):
+        store = {}
+        s3 = _make_s3_mock()
+
+        def get_object(Bucket, Key):
+            if Key not in store:
+                raise NoSuchKey()
+            body = store[Key]
+            return {"Body": MagicMock(read=lambda: body)}
+
+        def put_object(Bucket, Key, Body, **kwargs):
+            store[Key] = Body.encode() if isinstance(Body, str) else Body
+
+        s3.get_object.side_effect = get_object
+        s3.put_object.side_effect = put_object
+        s3.delete_object.side_effect = lambda Bucket, Key: store.pop(Key, None)
+        lam = MagicMock()
+        lam.invoke.return_value = {"StatusCode": 202}
+        mod = _import_module(s3_mock=s3, lambda_mock=lam)
+
+        old_start = (datetime.utcnow() - timedelta(days=5)).isoformat()
+        cp = {"scan_id": "2026-06-10", "started_at": old_start, "completed": [],
+              "completed_count": 0, "total_count": 3, "errors": [], "last_updated": old_start}
+        cp["signature"] = mod._generate_checkpoint_signature(cp)
+        store[mod.CHECKPOINT_KEY] = json.dumps(cp).encode()
+
+        pairs = [("111", "us-east-1"), ("222", "us-east-1"), ("333", "us-east-1")]
+        # First run: time runs out after two dispatches.
+        first_ctx = MagicMock()
+        first_ctx.get_remaining_time_in_millis.side_effect = [900000, 900000] + [1000] * 10
+        with patch.object(mod, "discover_accounts", return_value=["111", "222", "333"]), \
+                patch.object(mod, "build_account_region_list", return_value=pairs):
+            first = mod.lambda_handler({"trigger_source": "test"}, first_ctx)
+            dispatched_first = [json.loads(c.kwargs["Payload"])["account_id"]
+                                for c in lam.invoke.call_args_list]
+            second = mod.lambda_handler({"trigger_source": "test"}, _make_context())
+
+        assert dispatched_first == ["111", "222"]
+        assert first["status"] == "fanout_partial"
+        dispatched_all = [json.loads(c.kwargs["Payload"])["account_id"] for c in lam.invoke.call_args_list]
+        assert dispatched_all == ["111", "222", "333"]  # second run sends only the rest
+        assert second["status"] == "fanout_dispatched"
+        assert mod.CHECKPOINT_KEY not in store
+
+    def test_fanout_partial_does_not_mark_failed_invoke_completed(self):
+        """L2: a pair whose async invoke was refused must be retried, not marked completed."""
+        store = {}
+        s3 = _make_s3_mock()
+
+        def get_object(Bucket, Key):
+            if Key not in store:
+                raise NoSuchKey()
+            body = store[Key]
+            return {"Body": MagicMock(read=lambda: body)}
+
+        def put_object(Bucket, Key, Body, **kwargs):
+            store[Key] = Body.encode() if isinstance(Body, str) else Body
+
+        s3.get_object.side_effect = get_object
+        s3.put_object.side_effect = put_object
+        s3.delete_object.side_effect = lambda Bucket, Key: store.pop(Key, None)
+        lam = MagicMock()
+        # First run: 111 is refused (throttled), 222 accepted. Second run: all accepted.
+        lam.invoke.side_effect = [Exception("TooManyRequestsException"), {"StatusCode": 202},
+                                  {"StatusCode": 202}, {"StatusCode": 202}]
+        mod = _import_module(s3_mock=s3, lambda_mock=lam)
+
+        old_start = (datetime.utcnow() - timedelta(days=5)).isoformat()
+        cp = {"scan_id": "2026-06-10", "started_at": old_start, "completed": [],
+              "completed_count": 0, "total_count": 3, "errors": [], "last_updated": old_start}
+        cp["signature"] = mod._generate_checkpoint_signature(cp)
+        store[mod.CHECKPOINT_KEY] = json.dumps(cp).encode()
+
+        pairs = [("111", "us-east-1"), ("222", "us-east-1"), ("333", "us-east-1")]
+        first_ctx = MagicMock()
+        first_ctx.get_remaining_time_in_millis.side_effect = [900000, 900000] + [1000] * 10
+        with patch.object(mod, "discover_accounts", return_value=["111", "222", "333"]), \
+                patch.object(mod, "build_account_region_list", return_value=pairs):
+            first = mod.lambda_handler({"trigger_source": "test"}, first_ctx)
+            saved = json.loads(store[mod.CHECKPOINT_KEY])
+            second = mod.lambda_handler({"trigger_source": "test"}, _make_context())
+
+        assert first["status"] == "fanout_partial"
+        assert saved["completed"] == ["222/us-east-1"]
+        assert [e["pair"] for e in saved["errors"]] == ["111/us-east-1"]
+        dispatched = [json.loads(c.kwargs["Payload"])["account_id"] for c in lam.invoke.call_args_list]
+        assert dispatched == ["111", "222", "111", "333"]  # the refused pair is sent again
+        assert second["status"] == "fanout_dispatched"
+        completion = [k for k in store if k.startswith(mod.COMPLETION_KEY_PREFIX)]
+        assert len(completion) == 1
+        assert mod.CHECKPOINT_KEY not in store

@@ -22,7 +22,7 @@
       },
       "tags": {
         "type": "object",
-        "maxProperties": 50,
+        "maxProperties": 128,
         "additionalProperties": {
           "type": "string",
           "maxLength": 256
@@ -30,7 +30,7 @@
       },
       "previous_tags": {
         "type": "object",
-        "maxProperties": 50,
+        "maxProperties": 128,
         "additionalProperties": {
           "type": "string",
           "maxLength": 256
@@ -59,6 +59,14 @@
       },
       "scan_id": {
         "type": "string",
+        "maxLength": 128
+      },
+      "changed_by": {
+        "type": ["string", "null"],
+        "maxLength": 2048
+      },
+      "event_name": {
+        "type": ["string", "null"],
         "maxLength": 128
       }
     }

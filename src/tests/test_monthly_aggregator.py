@@ -1,401 +1,423 @@
-"""Tests for Monthly Aggregator Lambda Handler."""
+"""Tests for the Monthly Aggregator Lambda Handler (UNLOAD-based compaction)."""
 
 import os
+import re
 import sys
-from unittest.mock import patch, MagicMock
+from datetime import datetime, timezone
+from unittest.mock import MagicMock, patch
 
 import pytest
+import yaml
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-
-class _GlueEntityNotFoundException(Exception):
-    pass
-
-
-class _GlueAlreadyExistsException(Exception):
-    pass
+BUCKET = "amzn-s3-demo-analytics-bucket"
+A1, A2 = "111111111111", "222222222222"
+CORE_STACK = os.path.join(os.path.dirname(__file__), "..", "..", "deployment", "core-stack.yaml")
 
 
 @pytest.fixture(autouse=True)
 def mock_env(monkeypatch):
-    monkeypatch.setenv("CENTRAL_ANALYTICS_BUCKET", "test-analytics-bucket")
-    monkeypatch.setenv("ATHENA_RESULTS_BUCKET", "test-athena-results")
-    monkeypatch.setenv("ATHENA_DATABASE", "test_db")
-    monkeypatch.setenv("ATHENA_WORKGROUP", "test-workgroup")
-    monkeypatch.setenv("RETENTION_DAYS", "90")
-    monkeypatch.setenv("ENVIRONMENT", "dev")
-    monkeypatch.setenv("LOG_LEVEL", "DEBUG")
+    monkeypatch.setenv("CENTRAL_ANALYTICS_BUCKET", BUCKET)
+    monkeypatch.setenv("ATHENA_RESULTS_BUCKET", "amzn-s3-demo-athena-results")
+    monkeypatch.setenv("ATHENA_DATABASE", "ti_us-east-1_dev_123456789012")
+    monkeypatch.setenv("ATHENA_WORKGROUP", "ti-us-east-1-dev-123456789012")
 
 
 @pytest.fixture
 def mod():
-    """Import module with mocked AWS clients; yield (module, s3, athena, glue)."""
-    mock_s3, mock_athena, mock_glue = MagicMock(), MagicMock(), MagicMock()
-    mock_glue.exceptions.EntityNotFoundException = _GlueEntityNotFoundException
-    mock_glue.exceptions.AlreadyExistsException = _GlueAlreadyExistsException
-
-    def factory(service, **kw):
-        return {"s3": mock_s3, "athena": mock_athena, "glue": mock_glue}.get(
-            service, MagicMock()
-        )
-
-    with patch("boto3.client", side_effect=factory):
+    s3, athena, glue = MagicMock(), MagicMock(), MagicMock()
+    with patch("boto3.client", side_effect=lambda svc, **kw: {"s3": s3, "athena": athena, "glue": glue}[svc]):
         sys.modules.pop("lambda_handlers.monthly_aggregator_handler", None)
         import lambda_handlers.monthly_aggregator_handler as m
+    m.s3_client, m.athena_client, m.glue_client = s3, athena, glue
+    with patch.object(m.time, "sleep"):
+        yield m, s3, athena, glue
+    sys.modules.pop("lambda_handlers.monthly_aggregator_handler", None)
 
-        m.s3_client, m.athena_client, m.glue_client = mock_s3, mock_athena, mock_glue
-        yield m, mock_s3, mock_athena, mock_glue
 
+def _setup(m, s3, athena, glue, recent, historical=(), s3_keys=None, state="SUCCEEDED"):
+    """recent: {account: [days]}; historical: accounts already compacted."""
+    def get_partitions_pages(DatabaseName, TableName, Expression):
+        assert Expression == "year = 2026 AND month = 9"
+        if TableName == "resource_tag_deltas_recent":
+            parts = [{"Values": [a, "2026", "9", str(d)]} for a, days in recent.items() for d in days]
+        else:
+            parts = [{"Values": [a, "2026", "9"]} for a in historical]
+        # two pages to prove all pages are consumed
+        return [{"Partitions": parts[:1]}, {"Partitions": parts[1:]}]
 
-def _athena_result(columns, rows):
-    """Build a paginator return value for Athena results."""
-    col_info = [{"Name": c} for c in columns]
-    header = {"Data": [{"VarCharValue": c} for c in columns]}
-    data_rows = [{"Data": [{"VarCharValue": v} for v in row]} for row in rows]
-    return [
-        {
-            "ResultSet": {
-                "ResultSetMetadata": {"ColumnInfo": col_info},
-                "Rows": [header] + data_rows,
-            }
-        }
+    glue_pager, s3_pager = MagicMock(), MagicMock()
+    glue_pager.paginate.side_effect = get_partitions_pages
+    glue.get_paginator.return_value = glue_pager
+    glue.batch_create_partition.return_value = {}
+    glue.batch_delete_partition.return_value = {}
+
+    s3_keys = s3_keys if s3_keys is not None else {}
+    s3_pager.paginate.side_effect = lambda Bucket, Prefix: [
+        {"Contents": [{"Key": k} for k in s3_keys.get(Prefix, [])][:1]},
+        {"Contents": [{"Key": k} for k in s3_keys.get(Prefix, [])][1:]},
     ]
+    s3.get_paginator.return_value = s3_pager
+    s3.delete_objects.return_value = {}
+
+    athena.start_query_execution.side_effect = [{"QueryExecutionId": f"q{i}"} for i in range(50)]
+    athena.get_query_execution.return_value = {"QueryExecution": {"Status": {"State": state, "StateChangeReason": "boom"}}}
 
 
-# --- lambda_handler ---
+def _ctx(seconds=900):
+    ctx = MagicMock()
+    ctx.get_remaining_time_in_millis.return_value = seconds * 1000
+    return ctx
 
 
-def test_lambda_handler_success(mod):
+def _deleted_keys(s3):
+    return [o["Key"] for c in s3.delete_objects.call_args_list for o in c.kwargs["Delete"]["Objects"]]
+
+
+NOV2 = datetime(2026, 11, 2, 3, tzinfo=timezone.utc)
+
+
+# --- target month ---
+
+@pytest.mark.parametrize("now,expected", [
+    (datetime(2026, 11, 2, 3, tzinfo=timezone.utc), (2026, 9)),
+    (datetime(2027, 1, 2, 3, tzinfo=timezone.utc), (2026, 11)),
+    (datetime(2027, 2, 2, 3, tzinfo=timezone.utc), (2026, 12)),   # January rollover
+    (datetime(2027, 3, 2, 3, tzinfo=timezone.utc), (2027, 1)),    # short February does not skip January
+    (datetime(2027, 4, 2, 3, tzinfo=timezone.utc), (2027, 2)),
+])
+def test_target_month_default(mod, now, expected):
+    m = mod[0]
+    assert m.target_month({}, now) == expected
+
+
+def test_every_month_compacted_exactly_once_by_day2_schedule(mod):
+    m = mod[0]
+    targets = [m.target_month({}, datetime(y, mo, 2, 3, tzinfo=timezone.utc))
+               for y in (2027, 2028) for mo in range(1, 13)]
+    assert len(set(targets)) == 24
+    assert targets[0] == (2026, 11) and targets[-1] == (2028, 10)
+
+
+def test_target_month_override(mod):
+    m = mod[0]
+    assert m.target_month({"year": 2025, "month": 1}, NOV2) == (2025, 1)
+
+
+@pytest.mark.parametrize("event", [
+    {"year": 2019, "month": 1}, {"year": 2101, "month": 1}, {"year": 2025, "month": 0},
+    {"year": 2025, "month": 13}, {"year": "2025", "month": 1}, {"year": 2025}, {"month": True, "year": 2025},
+])
+def test_target_month_override_invalid(mod, event):
+    with pytest.raises(ValueError):
+        mod[0].target_month(event, NOV2)
+
+
+# --- SQL ---
+
+def test_unload_sql_columns_types_and_partition_filter(mod):
+    m = mod[0]
+    sql = m.build_unload_sql(m._config(), 2026, 9, [A1, A2])
+    assert sql.startswith("UNLOAD (")
+    assert 'FROM "ti_us-east-1_dev_123456789012".resource_tag_deltas_recent' in sql
+    assert "WHERE year = 2026 AND month = 9" in sql
+    assert f"account_id IN ('{A1}', '{A2}')" in sql
+    assert "GROUP BY account_id, year, month, arn" in sql
+    assert f"TO 's3://{BUCKET}/tag-deltas/historical/'" in sql
+    assert "partitioned_by = ARRAY['account_id', 'year', 'month']" in sql
+    assert "format = 'PARQUET', compression = 'SNAPPY'" in sql
+    assert "max_by(tags, timestamp) AS tags" in sql            # map stays a map
+    assert "min(timestamp) AS first_seen_timestamp" in sql      # bigint
+    assert "CAST(count(*) AS integer) AS change_count" in sql   # int
+    assert "max_by(changed_by, timestamp) FILTER (WHERE changed_by IS NOT NULL) AS changed_by" in sql
+    # output column order: data columns in Glue order, then partition columns last
+    select = sql.split("SELECT", 1)[1].split("FROM", 1)[0]
+    names = [re.split(r"\s+AS\s+", c.strip())[-1] for c in re.split(r",\s*\n", select)]
+    names = names[:-1] + [n.strip() for n in names[-1].split(",")]
+    assert names == [n for n, _ in m.HISTORICAL_COLUMNS] + ["account_id", "year", "month"]
+
+
+def test_historical_columns_match_glue_table(mod):
+    m = mod[0]
+
+    class Loader(yaml.SafeLoader):
+        pass
+    Loader.add_multi_constructor("!", lambda loader, suffix, node: None)
+    with open(CORE_STACK) as f:
+        resources = Loader(f).get_single_data()["Resources"]
+    table = resources["TagDeltasHistoricalTable"]["Properties"]["TableInput"]
+    glue_cols = [c["Name"] for c in table["StorageDescriptor"]["Columns"]]
+    ours = [n for n, _ in m.HISTORICAL_COLUMNS]
+    if "changed_by" not in glue_cols:  # columns appended by a parallel change
+        ours = [n for n in ours if n not in ("changed_by", "event_name")]
+    assert glue_cols == ours
+    assert [k["Name"] for k in table["PartitionKeys"]] == m.PARTITION_COLUMNS
+
+
+@pytest.mark.parametrize("cfg_override,accounts", [
+    ({"database": 'db"; DROP'}, [A1]),
+    ({"bucket": "Bad_Bucket"}, [A1]),
+    ({}, ["12345' OR '1"]),
+    ({}, []),
+    ({}, [f"{i:012d}" for i in range(101)]),
+])
+def test_unload_sql_rejects_bad_input(mod, cfg_override, accounts):
+    m = mod[0]
+    with pytest.raises(ValueError):
+        m.build_unload_sql({**m._config(), **cfg_override}, 2026, 9, accounts)
+
+
+def test_config_rejects_bad_database(mod, monkeypatch):
+    monkeypatch.setenv("ATHENA_DATABASE", "db;drop")
+    with pytest.raises(ValueError):
+        mod[0]._config()
+
+
+# --- handler flow ---
+
+def test_handler_happy_path(mod):
     m, s3, athena, glue = mod
-    s3.list_objects_v2.return_value = {
-        "CommonPrefixes": [
-            {"Prefix": "tag-deltas/recent/account_id=123456789012/"},
-            {"Prefix": "tag-deltas/recent/account_id=987654321098/"},
-        ]
+    rp = f"tag-deltas/recent/account_id={A1}/year=2026/month=9/"
+    keys = {
+        rp: [f"{rp}day=1/a.parquet", f"{rp}day=2/b.parquet", f"{rp}day=3/unregistered.parquet"],
+        f"tag-deltas/historical/account_id={A1}/year=2026/month=9/": ["tag-deltas/historical/account_id=111111111111/year=2026/month=9/orphan"],
     }
-    athena.start_query_execution.return_value = {"QueryExecutionId": "q1"}
-    athena.get_query_execution.return_value = {
-        "QueryExecution": {"Status": {"State": "SUCCEEDED"}}
-    }
-    pag = MagicMock()
-    pag.paginate.return_value = _athena_result(
-        ["arn", "change_type"], [["arn:aws:ec2:us-east-1:123:i/i-1", "ADDED"]]
-    )
-    athena.get_paginator.return_value = pag
-    glue.delete_partition.side_effect = _GlueEntityNotFoundException("nf")
-    m.HAS_PARQUET = False
-    result = m.lambda_handler({}, None)
-    assert result["accounts_processed"] == 2 and result["accounts_failed"] == 0
+    _setup(m, s3, athena, glue, {A1: [1, 2], A2: [5]}, s3_keys=keys)
+
+    result = m.lambda_handler({}, _ctx(), now=NOV2)
+
+    assert result["target_year"] == 2026 and result["target_month"] == 9
+    assert result["accounts_compacted"] == 2
+    assert athena.start_query_execution.call_count == 1
+    kw = athena.start_query_execution.call_args.kwargs
+    assert kw["WorkGroup"] == "ti-us-east-1-dev-123456789012"
+    created = glue.batch_create_partition.call_args.kwargs["PartitionInputList"]
+    assert [p["Values"] for p in created] == [[A1, "2026", "9"], [A2, "2026", "9"]]
+    assert created[0]["StorageDescriptor"]["Location"] == f"s3://{BUCKET}/tag-deltas/historical/account_id={A1}/year=2026/month=9/"
+    deleted = _deleted_keys(s3)
+    # orphan cleared before UNLOAD; only registered days deleted after
+    assert deleted == ["tag-deltas/historical/account_id=111111111111/year=2026/month=9/orphan",
+                       f"{rp}day=1/a.parquet", f"{rp}day=2/b.parquet"]
+    dropped = [p["Values"] for c in glue.batch_delete_partition.call_args_list for p in c.kwargs["PartitionsToDelete"]]
+    assert dropped == [[A1, "2026", "9", "1"], [A1, "2026", "9", "2"], [A2, "2026", "9", "5"]]
+    assert result["partitions_deleted"] == 3
 
 
-def test_lambda_handler_account_failure_continues(mod):
+def test_clear_happens_before_unload(mod):
     m, s3, athena, glue = mod
-    s3.list_objects_v2.return_value = {
-        "CommonPrefixes": [
-            {"Prefix": "tag-deltas/recent/account_id=111111111111/"},
-            {"Prefix": "tag-deltas/recent/account_id=222222222222/"},
-        ]
-    }
-    calls = [0]
-
-    def start_q(**kw):
-        calls[0] += 1
-        if calls[0] <= 1:
-            raise Exception("fail")
-        return {"QueryExecutionId": "q2"}
-
-    athena.start_query_execution.side_effect = start_q
-    athena.get_query_execution.return_value = {
-        "QueryExecution": {"Status": {"State": "SUCCEEDED"}}
-    }
-    pag = MagicMock()
-    pag.paginate.return_value = _athena_result(["arn"], [["arn:aws:s3:::b"]])
-    athena.get_paginator.return_value = pag
-    glue.delete_partition.side_effect = _GlueEntityNotFoundException("nf")
-    m.HAS_PARQUET = False
-    result = m.lambda_handler({}, None)
-    assert result["accounts_processed"] == 1 and result["accounts_failed"] == 1
+    hp = f"tag-deltas/historical/account_id={A1}/year=2026/month=9/"
+    _setup(m, s3, athena, glue, {A1: [1]}, s3_keys={hp: [f"{hp}old"]})
+    order = []
+    s3.delete_objects.side_effect = lambda **kw: order.append("delete") or {}
+    athena.start_query_execution.side_effect = lambda **kw: order.append("unload") or {"QueryExecutionId": "q"}
+    m.lambda_handler({}, _ctx(), now=NOV2)
+    assert order[:2] == ["delete", "unload"]
 
 
-def test_lambda_handler_fatal_error_raises(mod):
-    m, s3, _, _ = mod
-    s3.list_objects_v2.side_effect = Exception("Network error")
-    with patch.object(
-        m, "discover_accounts_via_athena", side_effect=Exception("fallback")
-    ):
-        with pytest.raises(Exception, match="fallback"):
-            m.lambda_handler({}, None)
-
-
-# --- discover_accounts ---
-
-
-def test_discover_accounts_from_s3(mod):
-    m, s3, _, _ = mod
-    s3.list_objects_v2.return_value = {
-        "CommonPrefixes": [
-            {"Prefix": "tag-deltas/recent/account_id=123456789012/"},
-            {"Prefix": "tag-deltas/recent/account_id=999888777666/"},
-        ]
-    }
-    assert set(m.discover_accounts(2025, 1)) == {"123456789012", "999888777666"}
-
-
-def test_discover_accounts_filters_invalid(mod):
-    m, s3, _, _ = mod
-    s3.list_objects_v2.return_value = {
-        "CommonPrefixes": [
-            {"Prefix": "tag-deltas/recent/account_id=123456789012/"},
-            {"Prefix": "tag-deltas/recent/account_id=short/"},
-            {"Prefix": "tag-deltas/recent/account_id=abcdefghijkl/"},
-        ]
-    }
-    assert m.discover_accounts(2025, 3) == ["123456789012"]
-
-
-def test_discover_accounts_athena_fallback(mod):
-    m, s3, athena, _ = mod
-    s3.list_objects_v2.side_effect = Exception("S3 error")
-    athena.start_query_execution.return_value = {"QueryExecutionId": "qfb"}
-    athena.get_query_execution.return_value = {
-        "QueryExecution": {"Status": {"State": "SUCCEEDED"}}
-    }
-    pag = MagicMock()
-    pag.paginate.return_value = _athena_result(["account_id"], [["111222333444"]])
-    athena.get_paginator.return_value = pag
-    assert m.discover_accounts(2025, 5) == ["111222333444"]
-
-
-def test_discover_accounts_empty(mod):
-    m, s3, _, _ = mod
-    s3.list_objects_v2.return_value = {}
-    assert m.discover_accounts(2025, 6) == []
-
-
-# --- execute_athena_query ---
-
-
-def test_execute_athena_query_success(mod):
-    m, _, athena, _ = mod
-    athena.start_query_execution.return_value = {"QueryExecutionId": "q"}
-    athena.get_query_execution.return_value = {
-        "QueryExecution": {"Status": {"State": "SUCCEEDED"}}
-    }
-    pag = MagicMock()
-    pag.paginate.return_value = _athena_result(
-        ["c1", "c2"], [["v1", "v2"], ["v3", "v4"]]
-    )
-    athena.get_paginator.return_value = pag
-    results = m.execute_athena_query("SELECT 1")
-    assert results == [{"c1": "v1", "c2": "v2"}, {"c1": "v3", "c2": "v4"}]
-
-
-def test_execute_athena_query_failed(mod):
-    m, _, athena, _ = mod
-    athena.start_query_execution.return_value = {"QueryExecutionId": "q"}
-    athena.get_query_execution.return_value = {
-        "QueryExecution": {"Status": {"State": "FAILED", "StateChangeReason": "err"}}
-    }
-    with pytest.raises(Exception, match="Query failed"):
-        m.execute_athena_query("BAD SQL")
-
-
-def test_execute_athena_query_timeout(mod):
-    m, _, athena, _ = mod
-    athena.start_query_execution.return_value = {"QueryExecutionId": "q"}
-    athena.get_query_execution.return_value = {
-        "QueryExecution": {"Status": {"State": "RUNNING"}}
-    }
-    with patch("lambda_handlers.monthly_aggregator_handler.time.sleep"):
-        with patch("lambda_handlers.monthly_aggregator_handler.time.time") as mt:
-            mt.side_effect = [0, 0, 301, 301]
-            with pytest.raises(Exception, match="Query timeout"):
-                m.execute_athena_query("SELECT 1", timeout=300)
-
-
-def test_execute_athena_query_cancelled(mod):
-    m, _, athena, _ = mod
-    athena.start_query_execution.return_value = {"QueryExecutionId": "q"}
-    athena.get_query_execution.return_value = {
-        "QueryExecution": {"Status": {"State": "CANCELLED", "StateChangeReason": "x"}}
-    }
-    with pytest.raises(Exception, match="Query failed"):
-        m.execute_athena_query("SELECT 1")
-
-
-# --- aggregate_account_month ---
-
-
-def test_aggregate_account_invalid_id(mod):
-    m, _, _, _ = mod
-    assert m.aggregate_account_month("short", 2025, 1) == 0
-    assert m.aggregate_account_month("abcdefghijkl", 2025, 1) == 0
-
-
-def test_aggregate_account_no_data(mod):
-    m, _, athena, _ = mod
-    athena.start_query_execution.return_value = {"QueryExecutionId": "q"}
-    athena.get_query_execution.return_value = {
-        "QueryExecution": {"Status": {"State": "SUCCEEDED"}}
-    }
-    pag = MagicMock()
-    pag.paginate.return_value = _athena_result(["arn"], [])
-    athena.get_paginator.return_value = pag
-    assert m.aggregate_account_month("123456789012", 2025, 6) == 0
-
-
-def test_aggregate_account_with_data(mod):
+def test_batches_of_100_accounts(mod):
     m, s3, athena, glue = mod
-    m.HAS_PARQUET = False
-    athena.start_query_execution.return_value = {"QueryExecutionId": "q"}
-    athena.get_query_execution.return_value = {
-        "QueryExecution": {"Status": {"State": "SUCCEEDED"}}
-    }
-    pag = MagicMock()
-    pag.paginate.return_value = _athena_result(
-        ["arn", "ct"], [["a1", "ADDED"], ["a2", "MOD"]]
-    )
-    athena.get_paginator.return_value = pag
-    assert m.aggregate_account_month("123456789012", 2025, 3) == 2
-    s3.put_object.assert_called_once()
+    _setup(m, s3, athena, glue, {f"{i:012d}": [1] for i in range(1, 251)})
+    result = m.lambda_handler({}, _ctx(), now=NOV2)
+    assert athena.start_query_execution.call_count == 3
+    assert result["accounts_compacted"] == 250
+    assert glue.batch_create_partition.call_count == 3
 
 
-# --- write_monthly_aggregate / write_monthly_json ---
+def test_already_compacted_accounts_are_not_reunloaded(mod):
+    m, s3, athena, glue = mod
+    _setup(m, s3, athena, glue, {A1: [1], A2: [1]}, historical=[A1])
+    result = m.lambda_handler({}, _ctx(), now=NOV2)
+    sql = athena.start_query_execution.call_args.kwargs["QueryString"]
+    assert f"'{A2}'" in sql and f"'{A1}'" not in sql
+    assert result["accounts_already_compacted"] == 1
+    dropped = [p["Values"][0] for c in glue.batch_delete_partition.call_args_list for p in c.kwargs["PartitionsToDelete"]]
+    assert dropped == [A1, A2]  # resume: finishes cleanup for A1 too
 
 
-def test_write_monthly_aggregate_empty(mod):
-    m, s3, _, glue = mod
-    m.write_monthly_aggregate([], "123456789012", 2025, 1)
-    s3.put_object.assert_not_called()
-    glue.create_partition.assert_not_called()
+def test_nothing_to_do(mod):
+    m, s3, athena, glue = mod
+    _setup(m, s3, athena, glue, {})
+    result = m.lambda_handler({"year": 2026, "month": 9}, _ctx())
+    athena.start_query_execution.assert_not_called()
+    assert result["accounts_compacted"] == 0
 
 
-def test_write_monthly_json(mod):
-    m, s3, _, _ = mod
-    m.write_monthly_json([{"arn": "a1"}], "account_id=123456789012/year=2025/month=3/")
-    kw = s3.put_object.call_args[1]
-    assert kw["Bucket"] == "test-analytics-bucket"
-    assert "historical" in kw["Key"] and "monthly-aggregate.json" in kw["Key"]
-
-
-def test_write_monthly_json_error(mod):
-    m, s3, _, _ = mod
-    s3.put_object.side_effect = Exception("S3 write failed")
-    with pytest.raises(Exception, match="S3 write failed"):
-        m.write_monthly_json([{"a": 1}], "account_id=123/year=2025/month=1/")
-
-
-# --- register_monthly_partition ---
-
-
-def test_register_partition_success(mod):
-    m, _, _, glue = mod
-    m.register_monthly_partition("123456789012", 2025, 6)
-    glue.create_partition.assert_called_once()
-    assert (
-        glue.create_partition.call_args[1]["TableName"]
-        == "resource_tag_deltas_historical"
-    )
-
-
-def test_register_partition_already_exists(mod):
-    m, _, _, glue = mod
-    glue.create_partition.side_effect = _GlueAlreadyExistsException("exists")
-    m.register_monthly_partition("123456789012", 2025, 6)  # no raise
-
-
-def test_register_partition_other_error(mod):
-    m, _, _, glue = mod
-    glue.create_partition.side_effect = Exception("Glue unavailable")
-    m.register_monthly_partition("123456789012", 2025, 6)  # logs warning, no raise
-
-
-# --- delete_daily_partitions ---
-
-
-def test_delete_daily_partitions_success(mod):
-    m, s3, _, glue = mod
-
-    def del_side(**kw):
-        if int(kw["PartitionValues"][3]) <= 3:
-            return {}
-        raise _GlueEntityNotFoundException("nf")
-
-    glue.delete_partition.side_effect = del_side
-    pag = MagicMock()
-    pag.paginate.return_value = [{"Contents": [{"Key": "k"}]}]
-    s3.get_paginator.return_value = pag
-    assert m.delete_daily_partitions("123456789012", 2025, 3) == 3
-
-
-def test_delete_daily_partitions_all_missing(mod):
-    m, _, _, glue = mod
-    glue.delete_partition.side_effect = _GlueEntityNotFoundException("nf")
-    assert m.delete_daily_partitions("123456789012", 2025, 1) == 0
-
-
-def test_delete_daily_partitions_error_returns_zero(mod):
-    m, _, _, glue = mod
-    glue.delete_partition.side_effect = RuntimeError("unexpected")
-    assert m.delete_daily_partitions("123456789012", 2025, 2) == 0
-
-
-# --- delete_s3_prefix ---
-
-
-def test_delete_s3_prefix_with_objects(mod):
-    m, s3, _, _ = mod
-    pag = MagicMock()
-    pag.paginate.return_value = [{"Contents": [{"Key": "f1"}, {"Key": "f2"}]}]
-    s3.get_paginator.return_value = pag
-    m.delete_s3_prefix("prefix/")
-    assert len(s3.delete_objects.call_args[1]["Delete"]["Objects"]) == 2
-
-
-def test_delete_s3_prefix_empty(mod):
-    m, s3, _, _ = mod
-    pag = MagicMock()
-    pag.paginate.return_value = [{"Contents": []}]
-    s3.get_paginator.return_value = pag
-    m.delete_s3_prefix("empty/")
+@pytest.mark.parametrize("state", ["FAILED", "CANCELLED"])
+def test_unload_failure_raises_and_deletes_nothing(mod, state):
+    m, s3, athena, glue = mod
+    _setup(m, s3, athena, glue, {A1: [1]}, state=state)
+    with pytest.raises(RuntimeError, match=state):
+        m.lambda_handler({}, _ctx(), now=NOV2)
+    glue.batch_create_partition.assert_not_called()
+    glue.batch_delete_partition.assert_not_called()
     s3.delete_objects.assert_not_called()
 
 
-def test_delete_s3_prefix_error(mod):
-    m, s3, _, _ = mod
-    pag = MagicMock()
-    pag.paginate.side_effect = Exception("denied")
-    s3.get_paginator.return_value = pag
-    with pytest.raises(Exception, match="denied"):
-        m.delete_s3_prefix("x/")
+def test_partition_registration_failure_deletes_nothing(mod):
+    m, s3, athena, glue = mod
+    rp = f"tag-deltas/recent/account_id={A1}/year=2026/month=9/"
+    _setup(m, s3, athena, glue, {A1: [1]}, s3_keys={rp: [f"{rp}day=1/a"]})
+    glue.batch_create_partition.return_value = {"Errors": [
+        {"PartitionValues": [A1, "2026", "9"], "ErrorDetail": {"ErrorCode": "AccessDeniedException"}}]}
+    with pytest.raises(RuntimeError, match="register"):
+        m.lambda_handler({}, _ctx(), now=NOV2)
+    glue.batch_delete_partition.assert_not_called()
+    s3.delete_objects.assert_not_called()
 
 
-# --- get_query_results ---
+def test_partition_already_exists_is_ok(mod):
+    m, s3, athena, glue = mod
+    _setup(m, s3, athena, glue, {A1: [1]})
+    glue.batch_create_partition.return_value = {"Errors": [
+        {"PartitionValues": [A1, "2026", "9"], "ErrorDetail": {"ErrorCode": "AlreadyExistsException"}}]}
+    m.lambda_handler({}, _ctx(), now=NOV2)
+    glue.batch_delete_partition.assert_called_once()
 
 
-def test_get_query_results_multiple_pages(mod):
-    m, _, athena, _ = mod
-    pag = MagicMock()
-    pag.paginate.return_value = [
-        {
-            "ResultSet": {
-                "ResultSetMetadata": {"ColumnInfo": [{"Name": "id"}]},
-                "Rows": [
-                    {"Data": [{"VarCharValue": "id"}]},
-                    {"Data": [{"VarCharValue": "1"}]},
-                ],
-            }
-        },
-        {
-            "ResultSet": {
-                "ResultSetMetadata": {"ColumnInfo": [{"Name": "id"}]},
-                "Rows": [
-                    {"Data": [{"VarCharValue": "id"}]},
-                    {"Data": [{"VarCharValue": "2"}]},
-                ],
-            }
-        },
-    ]
-    athena.get_paginator.return_value = pag
-    assert m.get_query_results("qid") == [{"id": "1"}, {"id": "2"}]
+def test_timeout_cancels_and_raises(mod):
+    m, s3, athena, glue = mod
+    _setup(m, s3, athena, glue, {f"{i:012d}": [1] for i in range(1, 151)}, state="RUNNING")
+    m.POLL_INTERVAL_SECONDS = 0
+    with pytest.raises(TimeoutError):
+        m.lambda_handler({}, _ctx(seconds=0), now=NOV2)
+    stopped = [c.kwargs["QueryExecutionId"] for c in athena.stop_query_execution.call_args_list]
+    assert stopped == ["q0", "q1"]
+    glue.batch_create_partition.assert_not_called()
+    s3.delete_objects.assert_not_called()
+
+
+def test_failure_cancels_other_running_unloads(mod):
+    m, s3, athena, glue = mod
+    _setup(m, s3, athena, glue, {f"{i:012d}": [1] for i in range(1, 151)})
+    athena.get_query_execution.side_effect = lambda QueryExecutionId: {"QueryExecution": {"Status": {
+        "State": "FAILED" if QueryExecutionId == "q0" else "RUNNING"}}}
+    with pytest.raises(RuntimeError):
+        m.lambda_handler({}, _ctx(), now=NOV2)
+    assert [c.kwargs["QueryExecutionId"] for c in athena.stop_query_execution.call_args_list] == ["q1"]
+
+
+def test_delete_objects_errors_raise_after_attempting_all_accounts(mod):
+    m, s3, athena, glue = mod
+    p1 = f"tag-deltas/recent/account_id={A1}/year=2026/month=9/"
+    p2 = f"tag-deltas/recent/account_id={A2}/year=2026/month=9/"
+    _setup(m, s3, athena, glue, {A1: [1], A2: [1]}, s3_keys={p1: [f"{p1}day=1/a"], p2: [f"{p2}day=1/b"]})
+    s3.delete_objects.side_effect = lambda **kw: (
+        {"Errors": [{"Key": "x", "Code": "AccessDenied"}]} if kw["Delete"]["Objects"][0]["Key"].startswith(p1) else {})
+    with pytest.raises(RuntimeError, match="1 accounts"):
+        m.lambda_handler({}, _ctx(), now=NOV2)
+    # A1's Glue partitions kept (its S3 delete failed); A2 fully cleaned
+    dropped = [p["Values"][0] for c in glue.batch_delete_partition.call_args_list for p in c.kwargs["PartitionsToDelete"]]
+    assert dropped == [A2]
+
+
+def test_clear_errors_raise_before_unload(mod):
+    m, s3, athena, glue = mod
+    hp = f"tag-deltas/historical/account_id={A1}/year=2026/month=9/"
+    _setup(m, s3, athena, glue, {A1: [1]}, s3_keys={hp: [f"{hp}old"]})
+    s3.delete_objects.return_value = {"Errors": [{"Key": f"{hp}old", "Code": "AccessDenied"}]}
+    with pytest.raises(RuntimeError):
+        m.lambda_handler({}, _ctx(), now=NOV2)
+    athena.start_query_execution.assert_not_called()
+
+
+def test_glue_delete_errors_raise(mod):
+    m, s3, athena, glue = mod
+    _setup(m, s3, athena, glue, {A1: [1]})
+    glue.batch_delete_partition.return_value = {"Errors": [
+        {"PartitionValues": [A1, "2026", "9", "1"], "ErrorDetail": {"ErrorCode": "InternalServiceException"}}]}
+    with pytest.raises(RuntimeError):
+        m.lambda_handler({}, _ctx(), now=NOV2)
+
+
+def test_invalid_account_partitions_skipped(mod):
+    m, s3, athena, glue = mod
+    _setup(m, s3, athena, glue, {"not-an-account": [1], A1: [1]})
+    result = m.lambda_handler({}, _ctx(), now=NOV2)
+    assert result["accounts_compacted"] == 1
+    assert "not-an-account" not in athena.start_query_execution.call_args.kwargs["QueryString"]
+
+
+# --- lifecycle vs. compaction age (B3) ---
+
+def _cfn(path):
+    class Loader(yaml.SafeLoader):
+        pass
+    Loader.add_multi_constructor("!", lambda loader, suffix, node: None)
+    with open(path) as f:
+        return Loader(f).get_single_data()["Resources"]
+
+
+def test_recent_lifecycle_outlives_compaction_with_a_missed_run(mod):
+    """Every daily object of the target month must still exist when the monthly
+    job reads it, even if one monthly run is missed (+31 days)."""
+    m = mod[0]
+    agg = _cfn(os.path.join(os.path.dirname(CORE_STACK), "aggregator-stack.yaml"))
+    cron = agg["MonthlyAggregationScheduleRule"]["Properties"]["ScheduleExpression"]
+    minute, hour, dom = re.fullmatch(r"cron\((\d+) (\d+) (\d+) \* \? \*\)", cron).groups()
+    rules = _cfn(CORE_STACK)["CentralAnalyticsBucket"]["Properties"]["LifecycleConfiguration"]["Rules"]
+    expiry = {r["Prefix"]: r for r in rules}["tag-deltas/recent/"]["ExpirationInDays"]
+
+    oldest = 0
+    for year in (2027, 2028):  # 2028 is a leap year
+        for month in range(1, 13):
+            run = datetime(year, month, int(dom), int(hour), int(minute), tzinfo=timezone.utc)
+            ty, tm = m.target_month({}, run)
+            # S3 expiry counts from creation, rounded up to the next midnight: +1 day.
+            oldest = max(oldest, (run - datetime(ty, tm, 1, tzinfo=timezone.utc)).days + 1)
+    assert expiry > oldest + 31, f"expiry {expiry}d, oldest object read at {oldest}d"
+
+
+# --- H4: an API error must not leave started UNLOADs running ---
+
+def test_start_error_cancels_already_started_unloads(mod):
+    """A throttled 2nd StartQueryExecution left q0 running. The async retry
+    then cleared q0's prefix and re-UNLOADed while q0 kept appending, so the
+    month ended with duplicate historical rows."""
+    m, s3, athena, glue = mod
+    _setup(m, s3, athena, glue, {f"{i:012d}": [1] for i in range(1, 151)})
+    athena.start_query_execution.side_effect = [{"QueryExecutionId": "q0"}, RuntimeError("TooManyRequestsException")]
+    with pytest.raises(RuntimeError, match="TooManyRequests"):
+        m.lambda_handler({}, _ctx(), now=NOV2)
+    assert [c.kwargs["QueryExecutionId"] for c in athena.stop_query_execution.call_args_list] == ["q0"]
+    glue.batch_create_partition.assert_not_called()
+
+
+def test_poll_error_cancels_running_unloads(mod):
+    m, s3, athena, glue = mod
+    _setup(m, s3, athena, glue, {f"{i:012d}": [1] for i in range(1, 151)})
+    athena.get_query_execution.side_effect = RuntimeError("ThrottlingException")
+    with pytest.raises(RuntimeError, match="Throttling"):
+        m.lambda_handler({}, _ctx(), now=NOV2)
+    assert [c.kwargs["QueryExecutionId"] for c in athena.stop_query_execution.call_args_list] == ["q0", "q1"]
+
+
+# --- H6: a manual run must not compact a month that has not ended ---
+
+@pytest.mark.parametrize("event", [{"year": 2026, "month": 11}, {"year": 2026, "month": 12}, {"year": 2027, "month": 1}])
+def test_target_month_override_rejects_unfinished_month(mod, event):
+    """Compacting the running month marks its accounts done; deltas written
+    later that month are then deleted by the next cleanup without ever being
+    compacted."""
+    with pytest.raises(ValueError, match="not ended"):
+        mod[0].target_month(event, NOV2)
+
+
+@pytest.mark.parametrize("event,now", [
+    ({"year": 2026, "month": 10}, NOV2),
+    ({"year": 2026, "month": 9}, datetime(2026, 10, 1, 0, 30, tzinfo=timezone.utc)),
+    ({"year": 2026, "month": 9}, datetime(2026, 10, 28, 23, 59, tzinfo=timezone.utc)),
+])
+def test_target_month_override_rejects_month_ended_under_min_age(mod, event, now):
+    """M1: deltas for a month keep landing after it ends (SQS redelivery, DLQ
+    redrive within 14 days). An early override marks the accounts done, and
+    the scheduled run for that month then deletes the late deltas in cleanup
+    without compacting them."""
+    with pytest.raises(ValueError, match="not ended"):
+        mod[0].target_month(event, now)
+
+
+def test_target_month_override_accepts_month_the_schedule_would_pick(mod):
+    m = mod[0]
+    assert m.target_month({"year": 2026, "month": 9}, NOV2) == m.target_month({}, NOV2) == (2026, 9)
+    assert m.target_month({"year": 2026, "month": 9}, datetime(2026, 10, 29, tzinfo=timezone.utc)) == (2026, 9)

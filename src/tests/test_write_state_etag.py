@@ -128,3 +128,185 @@ class TestWriteState:
         call_kwargs = mock_s3.put_object.call_args[1]
         assert "999888777666" in call_kwargs["Key"]
         assert "eu-west-1" in call_kwargs["Key"]
+
+
+# ---------------------------------------------------------------------------
+# G2: concurrent read-modify-write of the same state file
+# ---------------------------------------------------------------------------
+
+import io  # noqa: E402
+
+ACCT, REGION = "123456789012", "us-east-1"
+
+
+class FakeS3:
+    """In-memory S3 that honours IfMatch / IfNoneMatch like real conditional writes."""
+
+    def __init__(self):
+        self.objects = {}
+        self.version = 0
+        self.exceptions = MagicMock()
+        self.exceptions.NoSuchKey = NoSuchKey
+
+    def get_object(self, Bucket, Key):
+        if Key not in self.objects:
+            raise NoSuchKey(Key)
+        body, etag = self.objects[Key]
+        return {"Body": io.BytesIO(body), "ETag": etag}
+
+    def put_object(self, Bucket, Key, Body, IfMatch=None, IfNoneMatch=None, **_):
+        current = self.objects.get(Key)
+        if (IfNoneMatch == "*" and current is not None) or (
+                IfMatch is not None and (current is None or current[1] != IfMatch)):
+            raise ClientError({"Error": {"Code": "PreconditionFailed", "Message": "x"}}, "PutObject")
+        self.version += 1
+        etag = f'"{self.version}"'
+        self.objects[Key] = (Body if isinstance(Body, bytes) else Body.encode(), etag)
+        return {"ETag": etag}
+
+    def state(self):
+        return json.loads(gzip.decompress(self.objects[worker.state_key(ACCT, REGION)][0]))
+
+
+def _tag_event(arn, tags):
+    return {
+        "account": ACCT, "detail-type": "AWS API Call via CloudTrail",
+        "detail": {"eventName": "TagResource", "awsRegion": REGION,
+                   "requestParameters": {"resourceArn": arn, "tags": tags}},
+    }
+
+
+ARN1 = f"arn:aws:sqs:{REGION}:{ACCT}:q1"
+ARN2 = f"arn:aws:sqs:{REGION}:{ACCT}:q2"
+
+
+class TestConcurrentStateWrites:
+
+    def _seed(self, fake, state):
+        fake.put_object(Bucket="b", Key=worker.state_key(ACCT, REGION),
+                        Body=gzip.compress(json.dumps(state).encode()))
+
+    def _run_with_interleave(self, fake, outer, inner):
+        """Run outer(); while it publishes (after reading state), inner() runs to completion."""
+        real_publish = worker.publish_deltas
+        fired = []
+
+        def publish(*args):
+            if not fired:
+                fired.append(1)
+                inner()
+            return real_publish(*args)
+
+        with patch.object(worker, "s3", fake), patch.object(worker, "sqs", MagicMock()), \
+                patch.object(worker, "publish_deltas", side_effect=publish):
+            outer()
+
+    def test_two_realtime_events_keep_both_changes(self):
+        fake = FakeS3()
+        self._seed(fake, {ARN1: {"Env": "prod"}, ARN2: {"Env": "prod"}})
+        self._run_with_interleave(
+            fake,
+            outer=lambda: worker.process_real_time_event(_tag_event(ARN1, {"Team": "a"})),
+            inner=lambda: worker.process_real_time_event(_tag_event(ARN2, {"Team": "b"})),
+        )
+        assert fake.state() == {ARN1: {"Env": "prod", "Team": "a"},
+                                ARN2: {"Env": "prod", "Team": "b"}}
+
+    def test_scan_does_not_overwrite_realtime_change(self):
+        fake = FakeS3()
+        self._seed(fake, {ARN1: {"Env": "prod"}})
+        inventory = {ARN1: {"Env": "prod"}, ARN2: {}}
+        worker._HUB_ACCOUNT_ID = ACCT
+        with patch.object(worker, "discover_resources_for_account_region", return_value=inventory):
+            self._run_with_interleave(
+                fake,
+                outer=lambda: worker.process_account_region_scan(ACCT, REGION, "scan-1"),
+                inner=lambda: worker.process_real_time_event(_tag_event(ARN1, {"Team": "a"})),
+            )
+        assert fake.state() == {ARN1: {"Env": "prod", "Team": "a"}, ARN2: {}}
+
+    def test_first_write_is_create_only(self):
+        fake = FakeS3()
+        with patch.object(worker, "s3", fake):
+            base = worker.read_state(ACCT, REGION)
+            self._seed(fake, {ARN2: {"Env": "dev"}})  # someone else created it meanwhile
+            worker.save_state(ACCT, REGION, {ARN1: {"Env": "prod"}}, base)
+        assert fake.state() == {ARN1: {"Env": "prod"}, ARN2: {"Env": "dev"}}
+
+    def test_two_realtime_events_on_same_arn_keep_both_tags(self):
+        """L1: two writers tagging the SAME ARN with different keys must not drop either key."""
+        fake = FakeS3()
+        self._seed(fake, {ARN1: {"Env": "prod"}})
+        self._run_with_interleave(
+            fake,
+            outer=lambda: worker.process_real_time_event(_tag_event(ARN1, {"Team": "a"})),
+            inner=lambda: worker.process_real_time_event(_tag_event(ARN1, {"Owner": "b"})),
+        )
+        assert fake.state() == {ARN1: {"Env": "prod", "Team": "a", "Owner": "b"}}
+
+    def test_scan_change_on_arn_keeps_realtime_key(self):
+        """L1: a scan that changed one key of an ARN keeps a key a real-time writer added."""
+        fake = FakeS3()
+        self._seed(fake, {ARN1: {"Env": "dev", "Old": "x"}})
+        inventory = {ARN1: {"Env": "prod"}}  # scan saw Env changed and Old removed
+        worker._HUB_ACCOUNT_ID = ACCT
+        with patch.object(worker, "discover_resources_for_account_region", return_value=inventory):
+            self._run_with_interleave(
+                fake,
+                outer=lambda: worker.process_account_region_scan(ACCT, REGION, "scan-1"),
+                inner=lambda: worker.process_real_time_event(_tag_event(ARN1, {"Team": "a"})),
+            )
+        assert fake.state() == {ARN1: {"Env": "prod", "Team": "a"}}
+
+    def test_scan_removal_wins_over_concurrent_change(self):
+        """A resource the scan saw deleted stays deleted after a merge."""
+        fake = FakeS3()
+        self._seed(fake, {ARN1: {"Env": "prod"}, ARN2: {"Env": "prod"}})
+        worker._HUB_ACCOUNT_ID = ACCT
+        with patch.object(worker, "discover_resources_for_account_region",
+                          return_value={ARN2: {"Env": "prod"}}):
+            self._run_with_interleave(
+                fake,
+                outer=lambda: worker.process_account_region_scan(ACCT, REGION, "scan-1"),
+                inner=lambda: worker.process_real_time_event(_tag_event(ARN1, {"Team": "a"})),
+            )
+        assert fake.state() == {ARN2: {"Env": "prod"}}
+
+    def test_s3_replace_is_not_undone_by_concurrent_writer(self):
+        """PutBucketTagging replaces the whole set: a racing writer cannot resurrect a dropped key."""
+        bucket_arn = "arn:aws:s3:::amzn-s3-demo-bucket"
+        fake = FakeS3()
+        self._seed(fake, {bucket_arn: {"Old": "x"}, ARN1: {"Env": "prod"}})
+        put = {
+            "account": ACCT, "detail-type": "AWS API Call via CloudTrail",
+            "detail": {"eventName": "PutBucketTagging", "awsRegion": REGION,
+                       "requestParameters": {"bucketName": "amzn-s3-demo-bucket",
+                                             "Tagging": {"TagSet": {"Tag": [{"Key": "Team", "Value": "a"}]}}}},
+        }
+        # The racing writer keeps Old and adds Owner on the bucket, and changes ARN1.
+        racing = {"account": ACCT, "region": REGION, "detail-type": "Tag Change on Resource",
+                  "resources": [bucket_arn], "detail": {"tags": {"Old": "x", "Owner": "b"}}}
+
+        def inner():
+            worker.process_tag_change_event(racing)
+            worker.process_real_time_event(_tag_event(ARN1, {"Team": "b"}))
+
+        self._run_with_interleave(fake, outer=lambda: worker.process_real_time_event(put), inner=inner)
+        assert fake.state() == {bucket_arn: {"Team": "a"}, ARN1: {"Env": "prod", "Team": "b"}}
+
+    def test_retries_exhausted_raises(self):
+        """Every put conflicting must surface as StateConflict, not a silent drop."""
+        fake = FakeS3()
+        self._seed(fake, {ARN1: {"Env": "prod"}})
+        real_put = fake.put_object
+
+        def always_conflict(**kwargs):
+            raise ClientError({"Error": {"Code": "PreconditionFailed", "Message": "x"}}, "PutObject")
+
+        with patch.object(worker, "s3", fake):
+            base = worker.read_state(ACCT, REGION)
+            fake.put_object = always_conflict
+            with pytest.raises(worker.StateConflict):
+                worker.save_state(ACCT, REGION, {ARN1: {"Env": "dev"}}, base)
+        fake.put_object = real_put
+        assert fake.state() == {ARN1: {"Env": "prod"}}

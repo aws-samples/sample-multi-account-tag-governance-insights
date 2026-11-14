@@ -2,15 +2,17 @@
 TagInsights - Aggregator Coordinator Lambda
 
 Responsibilities:
-  1. Discover all AWS accounts in the org (via Organizations API, falling back
-     to Resource Explorer index list if not the management account).
+  1. Discover all AWS accounts in the org via the Organizations API. The hub
+     must be the management account or a delegated administrator; otherwise
+     the run fails rather than silently scanning only the hub.
   2. Read the scan checkpoint from S3 to determine which account+regions have
      already been processed in the current scan cycle.
   3. Process account+regions sequentially, invoking the Worker Lambda for each.
   4. Save checkpoint progress to S3 before the Lambda approaches timeout so
      the next scheduled invocation can resume where it left off.
   5. If the checkpoint shows the scan has been running for more than MAX_SCAN_DAYS,
-     switch to parallel fan-out mode: invoke all remaining workers concurrently.
+     switch to parallel fan-out mode: invoke all remaining workers asynchronously,
+     then close the cycle so the next run starts a fresh one.
 
 Scan cycle:
   - A "scan cycle" is identified by a scan_id (date string: YYYY-MM-DD).
@@ -33,10 +35,11 @@ import logging
 import time
 import hmac
 import hashlib
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 import boto3
+from botocore.config import Config
 from botocore.exceptions import ClientError
 
 logger = logging.getLogger()
@@ -56,9 +59,24 @@ TIMEOUT_BUFFER_MS = 120_000  # 2 minutes
 CHECKPOINT_KEY = 'aggregator-state/scan-checkpoint.json'
 COMPLETION_KEY_PREFIX = 'aggregator-state/completed/'
 
+# Keep at most this many recent per-pair errors in the checkpoint.
+MAX_CHECKPOINT_ERRORS = 100
+
+
+def _utcnow() -> datetime:
+    """Naive UTC now; same isoformat() output as the deprecated utcnow()."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
 # ── AWS clients ───────────────────────────────────────────────────────────────
 s3 = boto3.client('s3')
-lambda_client = boto3.client('lambda', region_name=HUB_REGION)
+# Worker runs in this stack's Region (default client Region). A synchronous
+# invoke can last up to the Worker's 900 s timeout: the default 60 s read
+# timeout plus retries would re-invoke a still-running worker concurrently.
+lambda_client = boto3.client(
+    'lambda',
+    config=Config(read_timeout=900, connect_timeout=10, retries={'max_attempts': 0}),
+)
 
 
 # ── Checkpoint helpers + HMAC integrity ───────────────────────────
@@ -68,15 +86,24 @@ _cached_signing_secret: Optional[str] = None
 
 def _checkpoint_signature_secret() -> str:
     """
-    Retrieve checkpoint signing secret from CHECKPOINT_SIGNING_SECRET env var.
-    Set via CloudFormation parameter (generate with 'openssl rand -hex 32').
+    Read the checkpoint signing secret from Secrets Manager (ARN in
+    CHECKPOINT_SECRET_ARN) once per container and cache it in memory.
+    Raises if the ARN is missing, the read fails, or the secret is empty.
     """
     global _cached_signing_secret
     if _cached_signing_secret:
         return _cached_signing_secret
-    secret = os.environ.get('CHECKPOINT_SIGNING_SECRET')
+    secret_arn = os.environ.get('CHECKPOINT_SECRET_ARN')
+    if not secret_arn:
+        raise RuntimeError("CHECKPOINT_SECRET_ARN environment variable is required")
+    try:
+        response = boto3.client('secretsmanager').get_secret_value(SecretId=secret_arn)
+    except ClientError as e:
+        code = e.response.get('Error', {}).get('Code', 'Unknown')
+        raise RuntimeError(f"Cannot read checkpoint signing secret: {code}") from e
+    secret = response.get('SecretString')
     if not secret:
-        raise RuntimeError("CHECKPOINT_SIGNING_SECRET environment variable is required")
+        raise RuntimeError("Checkpoint signing secret is empty")
     _cached_signing_secret = secret
     return secret
 
@@ -131,7 +158,8 @@ def read_checkpoint() -> Optional[Dict]:
     """
     Read the current scan checkpoint from S3.
     Validates HMAC signature to detect tampering.
-    Returns None if no checkpoint exists or if tampered.
+    Returns None if no checkpoint exists or if tampered. Any other read error
+    propagates: returning None would start a new cycle and overwrite progress.
     """
     try:
         response = s3.get_object(Bucket=CENTRAL_ANALYTICS_BUCKET, Key=CHECKPOINT_KEY)
@@ -153,9 +181,6 @@ def read_checkpoint() -> Optional[Dict]:
 
         return checkpoint
     except s3.exceptions.NoSuchKey:
-        return None
-    except Exception as e:
-        logger.warning(f"Error reading checkpoint: {e}")
         return None
 
 
@@ -187,7 +212,9 @@ def delete_checkpoint():
         s3.delete_object(Bucket=CENTRAL_ANALYTICS_BUCKET, Key=CHECKPOINT_KEY)
         logger.info("Scan checkpoint deleted (cycle complete)")
     except Exception as e:
-        logger.warning(f"Error deleting checkpoint: {e}")
+        # A stale checkpoint would make the next run resume a finished cycle.
+        logger.error(f"Error deleting checkpoint: {e}")
+        raise
 
 
 def write_completion_marker(scan_id: str, stats: Dict):
@@ -197,7 +224,7 @@ def write_completion_marker(scan_id: str, stats: Dict):
         s3.put_object(
             Bucket=CENTRAL_ANALYTICS_BUCKET,
             Key=key,
-            Body=json.dumps({**stats, 'scan_id': scan_id, 'completed_at': datetime.utcnow().isoformat()}),
+            Body=json.dumps({**stats, 'scan_id': scan_id, 'completed_at': _utcnow().isoformat()}),
             ContentType='application/json'
         )
         logger.info(f"Completion marker written: {key}")
@@ -223,68 +250,25 @@ def list_accounts_from_organizations() -> List[str]:
     return accounts
 
 
-def list_accounts_from_resource_explorer() -> List[str]:
-    """
-    Fallback: extract unique account IDs from Resource Explorer index list.
-    Works even if the hub account is not the management account.
-    RE aggregator index stores local indexes from all member accounts.
-    """
-    re = boto3.client('resource-explorer-2', region_name=HUB_REGION)
-    account_ids = set()
-    try:
-        response = re.list_indexes()
-        for index in response.get('Indexes', []):
-            # Index ARN format: arn:aws:resource-explorer-2:REGION:ACCOUNT:index/TYPE
-            parts = index.get('Arn', '').split(':')
-            if len(parts) > 4 and parts[4]:
-                account_ids.add(parts[4])
-    except Exception as e:
-        logger.warning(f"RE fallback account discovery failed: {e}")
-    logger.info(f"Resource Explorer fallback: discovered {len(account_ids)} accounts")
-    return list(account_ids)
-
-
 def discover_accounts() -> List[str]:
     """
-    Discover all accounts. Tries Organizations first, falls back to RE indexes.
+    Discover all ACTIVE org accounts via Organizations.
+
+    There is deliberately no fallback: ListIndexes only returns the hub's own
+    indexes, so a fallback would scan only the hub while reporting the cycle
+    complete.
     """
     try:
-        accounts = list_accounts_from_organizations()
-        if accounts:
-            return accounts
+        return list_accounts_from_organizations()
     except ClientError as e:
         code = e.response['Error']['Code']
         if code in ('AccessDeniedException', 'AWSOrganizationsNotInUseException'):
-            logger.info(f"Organizations API not available ({code}), falling back to RE index list")
-        else:
-            logger.warning(f"Organizations API error: {e}")
-
-    # Fallback: extract accounts from RE indexes
-    return list_accounts_from_resource_explorer()
-
-
-def get_active_regions_for_account(account_id: str) -> List[str]:
-    """
-    Return the list of regions that have a Resource Explorer local index for
-    this account. These are the regions where RE has discovered resources.
-    Only regions with a local index have data worth scanning.
-    """
-    re = boto3.client('resource-explorer-2', region_name=HUB_REGION)
-    regions = []
-    try:
-        response = re.list_indexes()
-        for index in response.get('Indexes', []):
-            parts = index.get('Arn', '').split(':')
-            if len(parts) > 4 and parts[4] == account_id:
-                region = parts[3]
-                if region:
-                    regions.append(region)
-    except Exception as e:
-        logger.warning(f"Could not get regions for account {account_id}: {e}")
-        # Fall back to common regions
-        regions = [HUB_REGION]
-
-    return regions if regions else [HUB_REGION]
+            raise RuntimeError(
+                f"Account discovery failed ({code}). The TagInsights hub must be the "
+                "Organizations management account or a delegated administrator "
+                "allowed to call organizations:ListAccounts."
+            ) from e
+        raise
 
 
 def build_account_region_list(accounts: List[str]) -> List[Tuple[str, str]]:
@@ -300,27 +284,32 @@ def build_account_region_list(accounts: List[str]) -> List[Tuple[str, str]]:
     re = boto3.client('resource-explorer-2', region_name=HUB_REGION)
     account_regions = []
 
-    # Step 1: Get hub-account regions from list_indexes
+    # Step 1: Get hub-account regions from list_indexes. Errors propagate: a
+    # hub-Region-only fallback would let the cycle finish (and be marked
+    # complete) without scanning any other Region.
     hub_regions = []
-    try:
-        response = re.list_indexes()
-        indexes = response.get('Indexes', [])
+    indexes = [
+        index
+        for page in re.get_paginator('list_indexes').paginate()
+        for index in page.get('Indexes', [])
+    ]
 
-        for index in indexes:
-            parts = index.get('Arn', '').split(':')
-            if len(parts) > 4:
-                region = parts[3]
-                if region and region not in hub_regions:
-                    hub_regions.append(region)
+    for index in indexes:
+        parts = index.get('Arn', '').split(':')
+        if len(parts) > 4:
+            region = parts[3]
+            if region and region not in hub_regions:
+                hub_regions.append(region)
 
-        logger.info(f"Discovered {len(hub_regions)} active regions from RE indexes")
-
-    except Exception as e:
-        logger.warning(f"Could not list RE indexes: {e}. Using hub region only.")
-        hub_regions = [HUB_REGION]
+    logger.info(f"Discovered {len(hub_regions)} active regions from RE indexes")
 
     if not hub_regions:
         hub_regions = [HUB_REGION]
+
+    # Global resources (IAM, CloudFront, Route 53, ...) only match the
+    # Resource Explorer filter region:global, never a real Region.
+    if 'global' not in hub_regions:
+        hub_regions.append('global')
 
     # Step 2: Cross-product ALL org accounts × hub regions
     # The Worker uses the org-wide RE view (accountid:X region:Y filter) so
@@ -422,19 +411,21 @@ def sequential_scan(
         if success:
             completed.add(pair_key)
             processed_this_invocation += 1
+            # A retry that succeeds clears that pair's earlier failures.
+            errors = [e for e in errors if e.get('pair') != pair_key]
         else:
-            errors.append({'pair': pair_key, 'timestamp': datetime.utcnow().isoformat()})
+            errors.append({'pair': pair_key, 'timestamp': _utcnow().isoformat()})
+            errors = errors[-MAX_CHECKPOINT_ERRORS:]
             failed_this_invocation += 1
             # Don't mark as completed — will retry on next invocation
 
-        # Update checkpoint after each successful worker
         checkpoint['completed'] = list(completed)
         checkpoint['completed_count'] = len(completed)
         checkpoint['errors'] = errors
-        checkpoint['last_updated'] = datetime.utcnow().isoformat()
+        checkpoint['last_updated'] = _utcnow().isoformat()
 
-        # Persist checkpoint every 10 completions to avoid losing progress
-        if processed_this_invocation % 10 == 0:
+        # Persist after each successful pair so a crash loses at most one pair
+        if success:
             write_checkpoint(checkpoint)
 
     # Final checkpoint save for this invocation
@@ -451,31 +442,45 @@ def sequential_scan(
 
 def fanout_scan(
     remaining_pairs: List[Tuple[str, str]],
-    scan_id: str
+    scan_id: str,
+    context=None
 ) -> Dict:
     """
     Fan-out mode: invoke all remaining workers asynchronously in parallel.
     Used when sequential scan has been running for more than MAX_SCAN_DAYS.
 
-    Workers run in parallel bounded by Lambda's ReservedConcurrentExecutions (200).
-    If more than 200 pairs, they'll queue up as Lambda scales.
+    Parallelism is capped by the Worker's ReservedConcurrentExecutions (20);
+    excess async invocations wait in Lambda's internal queue (retried per the
+    Worker's EventInvokeConfig, failures go to the worker-failures queue).
+
+    Stops early when context says the Lambda is near its timeout; 'attempted'
+    is how many pairs (from the front of remaining_pairs) were tried, and
+    'failed_pairs' the 'account/region' keys whose invoke was not accepted.
     """
     logger.info(f"Fan-out mode: invoking {len(remaining_pairs)} workers in parallel")
     success_count = 0
     error_count = 0
+    attempted = 0
+    failed_pairs = []
 
     for account_id, region in remaining_pairs:
+        if context is not None and context.get_remaining_time_in_millis() < TIMEOUT_BUFFER_MS:
+            logger.info(f"Approaching timeout during fan-out after {attempted} pairs. Saving checkpoint.")
+            break
+        attempted += 1
         success = invoke_worker(account_id, region, scan_id, async_mode=True)
         if success:
             success_count += 1
         else:
             error_count += 1
+            failed_pairs.append(f"{account_id}/{region}")
         # Brief pause to avoid Lambda invoke API throttling at scale
         if success_count % 50 == 0 and success_count > 0:
             time.sleep(0.5)
 
     logger.info(f"Fan-out dispatched: {success_count} workers invoked, {error_count} errors")
-    return {'dispatched': success_count, 'errors': error_count}
+    return {'dispatched': success_count, 'errors': error_count, 'attempted': attempted,
+            'failed_pairs': failed_pairs}
 
 
 # ── Main handler ──────────────────────────────────────────────────────────────
@@ -493,13 +498,15 @@ def lambda_handler(event, context):
       6. If all done, write completion marker and clean up checkpoint
     """
     logger.info(f"Coordinator started. Event: {event.get('trigger_source', 'unknown')}")
-    start_time = datetime.utcnow()
+    start_time = _utcnow()
     today = start_time.strftime('%Y-%m-%d')
 
     if not CENTRAL_ANALYTICS_BUCKET:
         raise ValueError("CENTRAL_ANALYTICS_BUCKET environment variable is not set")
     if not WORKER_FUNCTION_NAME:
         raise ValueError("WORKER_FUNCTION_NAME environment variable is not set")
+    # Fail before any scan work if the signing secret cannot be read.
+    _checkpoint_signature_secret()
 
     # ── Step 1: Read checkpoint ───────────────────────────────────────────────
     checkpoint = read_checkpoint()
@@ -562,13 +569,44 @@ def lambda_handler(event, context):
             f"Scan cycle {scan_id} has been running for {scan_age_days} days "
             f"(MAX_SCAN_DAYS={MAX_SCAN_DAYS}). Switching to fan-out mode."
         )
-        fanout_result = fanout_scan(remaining, scan_id)
+        fanout_result = fanout_scan(remaining, scan_id, context)
+        failed_pairs = fanout_result.pop('failed_pairs')
 
-        # Mark all as "in progress" in checkpoint — workers will complete independently
-        # On the next daily invocation, we'll start a fresh cycle
-        checkpoint['fanout_dispatched'] = True
-        checkpoint['fanout_at'] = datetime.utcnow().isoformat()
-        write_checkpoint(checkpoint)
+        if fanout_result['attempted'] < len(remaining):
+            # Out of time: record what was dispatched so the next run fans out
+            # only the rest, instead of re-sending the same head of the list
+            # every day and never reaching the tail. A pair whose invoke was
+            # refused was never queued, so it stays remaining (like a failed
+            # pair in sequential_scan) and is sent again next run.
+            dispatched_now = [f"{a}/{r}" for a, r in remaining[:fanout_result['attempted']]
+                              if f"{a}/{r}" not in failed_pairs]
+            completed_set.update(dispatched_now)
+            errors = [e for e in checkpoint.get('errors', []) if e.get('pair') not in dispatched_now]
+            errors += [{'pair': p, 'timestamp': _utcnow().isoformat()} for p in failed_pairs]
+            checkpoint['errors'] = errors[-MAX_CHECKPOINT_ERRORS:]
+            checkpoint['completed'] = list(completed_set)
+            checkpoint['completed_count'] = len(completed_set)
+            checkpoint['last_updated'] = _utcnow().isoformat()
+            write_checkpoint(checkpoint)
+            return {
+                'status': 'fanout_partial',
+                'scan_id': scan_id,
+                'remaining': len(remaining) - fanout_result['attempted'],
+                **fanout_result
+            }
+
+        # Workers finish independently (failures land in the worker-failures
+        # queue). Close the cycle so the next run starts fresh instead of
+        # fanning out the same pairs again every day.
+        write_completion_marker(scan_id, {
+            'mode': 'fanout',
+            'total_account_regions': total,
+            'completed': len(completed_set),
+            'errors': len(checkpoint.get('errors', [])),
+            'duration_days': scan_age_days,
+            **fanout_result,
+        })
+        delete_checkpoint()
 
         return {
             'status': 'fanout_dispatched',

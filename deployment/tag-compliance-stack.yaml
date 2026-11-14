@@ -62,7 +62,9 @@ Parameters:
       organization rule evaluates, including this one). Config invokes the function
       cross-account as the config.amazonaws.com service principal; the only Lambda
       permission condition it satisfies is SourceAccount (live test: PrincipalOrgID
-      returns AccessDenied), so one permission is created per account.
+      returns AccessDenied), so one permission is created per account. Each permission adds
+      a statement to the function's resource-based policy, which Lambda caps at 20 KB:
+      roughly 60-80 accounts fit. Beyond that, split accounts across rule stacks.
 
   ExcludedAccounts:
     Type: CommaDelimitedList
@@ -95,8 +97,16 @@ Parameters:
     Default: WARNING
     AllowedValues: [DEBUG, INFO, WARNING, ERROR]
 
+  EnableCodeSigning:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Enforce AWS Signer code signing and load packages from signed/v<version>/.
+      Requires the taginsights-lambda-signer profile and package_lambdas.py --sign.
+
 Conditions:
-  IsProduction: !Equals [!Ref Environment, "prod"]
+  UseCodeSigning: !Equals [!Ref EnableCodeSigning, "true"]
   HasExcludedAccounts: !Not [!Equals [!Join ["", !Ref ExcludedAccounts], ""]]
   EnableReport: !And
     - !Not [!Equals [!Ref AggregatorName, ""]]
@@ -137,7 +147,7 @@ Resources:
               StringEquals:
                 aws:SourceAccount: !Ref AWS::AccountId
       ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
       Policies:
         - PolicyName: TagComplianceRulePolicy
           PolicyDocument:
@@ -156,7 +166,7 @@ Resources:
 
   RuleCodeSigningConfig:
     Type: AWS::Lambda::CodeSigningConfig
-    Condition: IsProduction
+    Condition: UseCodeSigning
     Properties:
       Description: !Sub "TagInsights tag compliance code signing - ${Environment}"
       AllowedPublishers:
@@ -169,17 +179,20 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub "${ProjectName}-tag-compliance-rule-${Environment}"
-      Runtime: python3.11
+      Runtime: python3.14
       Handler: tag_compliance_rule.lambda_handler
       Role: !GetAtt RuleFunctionRole.Arn
       Timeout: 60
       MemorySize: 256
+      # Caps Config bursts (and member-account PutEvaluations throttling). Lambda keeps 100
+      # unreserved, so the account's concurrency quota must be at least 120; new accounts
+      # with a lower quota must request an increase or remove this line.
       ReservedConcurrentExecutions: 20
-      CodeSigningConfigArn: !If [IsProduction, !Ref RuleCodeSigningConfig, !Ref AWS::NoValue]
+      CodeSigningConfigArn: !If [UseCodeSigning, !Ref RuleCodeSigningConfig, !Ref AWS::NoValue]
       Code:
         S3Bucket: !Ref LambdaCodeBucket
         S3Key: !If
-          - IsProduction
+          - UseCodeSigning
           - !Sub "signed/v${DeploymentVersion}/tag_compliance_rule.zip"
           - !Sub "lambda-packages/v${DeploymentVersion}/tag_compliance_rule.zip"
       Environment:
@@ -194,8 +207,8 @@ Resources:
           Value: !Ref Environment
 
   # One invoke permission per member account, each pinned with SourceAccount.
-  # ponytail: account list is a parameter; add accounts on org growth, or move to
-  # a Lambda-backed custom resource that reads Organizations if that gets tedious.
+  # The account list is a parameter: update it when accounts join the organization.
+  # The 20 KB resource-policy limit caps this at roughly 60-80 accounts per function.
   Fn::ForEach::RuleFunctionConfigPermissions:
     - AccountId
     - !Ref MemberAccountIds
@@ -239,7 +252,7 @@ Resources:
               StringEquals:
                 aws:SourceAccount: !Ref AWS::AccountId
       ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
       Policies:
         - PolicyName: TagComplianceReportPolicy
           PolicyDocument:
@@ -262,16 +275,16 @@ Resources:
     Condition: EnableReport
     Properties:
       FunctionName: !Sub "${ProjectName}-tag-compliance-report-${Environment}"
-      Runtime: python3.11
+      Runtime: python3.14
       Handler: tag_compliance_report.lambda_handler
       Role: !GetAtt ReportFunctionRole.Arn
       Timeout: 300
       MemorySize: 256
-      CodeSigningConfigArn: !If [IsProduction, !Ref RuleCodeSigningConfig, !Ref AWS::NoValue]
+      CodeSigningConfigArn: !If [UseCodeSigning, !Ref RuleCodeSigningConfig, !Ref AWS::NoValue]
       Code:
         S3Bucket: !Ref LambdaCodeBucket
         S3Key: !If
-          - IsProduction
+          - UseCodeSigning
           - !Sub "signed/v${DeploymentVersion}/tag_compliance_report.zip"
           - !Sub "lambda-packages/v${DeploymentVersion}/tag_compliance_report.zip"
       Environment:
