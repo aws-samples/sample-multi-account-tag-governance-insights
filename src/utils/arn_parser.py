@@ -210,7 +210,7 @@ if __name__ == "__main__":
         "arn:aws:codecommit:us-east-1:1234567890123:TagInsights",
         "arn:aws:rds:us-east-1:1234567890123:cluster:db-neptune-1",
         "arn:aws:iam::1234567890123:role/MyRole",
-        "arn:aws:s3:::my-bucket",
+        "arn:aws:s3:::amzn-s3-demo-bucket",
         "arn:aws:lambda:us-west-2:123456789012:function:my-function:1",
     ]
 

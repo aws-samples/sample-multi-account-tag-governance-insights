@@ -24,7 +24,9 @@ with patch("boto3.client", return_value=_s3()):
     import src.lambda_handlers.aggregator_worker as worker
 
 ACCT, REGION = "123456789012", "us-east-1"
-worker.CENTRAL_ANALYTICS_BUCKET = worker.CENTRAL_ANALYTICS_BUCKET or "test-bucket"
+MEMBER = "111122223333"
+worker.CENTRAL_ANALYTICS_BUCKET = worker.CENTRAL_ANALYTICS_BUCKET or "amzn-s3-demo-bucket"
+worker._HUB_ACCOUNT_ID = ACCT  # never call STS from tests
 
 
 def _re_resource(i, tags=None):
@@ -65,6 +67,38 @@ class TestDiscovery:
             with pytest.raises(RuntimeError):
                 worker.process_account_region_scan(ACCT, REGION, "scan-1")
         s3.put_object.assert_not_called()
+
+    def test_missing_org_view_fails_member_scan(self):
+        client = _re_client(pages=[{"Resources": []}])
+        s3 = _s3()
+        with patch.object(worker.boto3, "client", return_value=client), \
+                patch.object(worker, "get_org_view_arn", return_value=None), \
+                patch.object(worker, "s3", s3):
+            with pytest.raises(RuntimeError, match="org-scoped"):
+                worker.process_account_region_scan(MEMBER, REGION, "scan-1")
+        s3.put_object.assert_not_called()
+
+    def test_org_view_lookup_does_not_cache_none(self):
+        client = MagicMock()
+        client.get_paginator.return_value.paginate.side_effect = [
+            [{"Views": ["arn:aws:resource-explorer-2:us-east-1:123456789012:view/default/1"]}],
+            [{"Views": ["arn:aws:resource-explorer-2:us-east-1:123456789012:view/org/2"]}],
+        ]
+        worker._ORG_VIEW_ARN = None
+        with patch.object(worker.boto3, "client", return_value=client):
+            assert worker.get_org_view_arn() is None
+            assert worker.get_org_view_arn().endswith("view/org/2")
+        worker._ORG_VIEW_ARN = None
+
+    def test_empty_member_inventory_refuses_mass_removal(self):
+        previous = {f"arn:aws:sqs:us-east-1:{MEMBER}:gone": {"Env": "prod"}}
+        with patch.object(worker, "discover_resources_for_account_region", return_value={}), \
+                patch.object(worker, "read_state", return_value=previous), \
+                patch.object(worker, "write_deltas") as wd, \
+                patch.object(worker, "write_state") as ws:
+            with pytest.raises(RuntimeError, match="Empty"):
+                worker.process_account_region_scan(MEMBER, REGION, "scan-1")
+        wd.assert_not_called(); ws.assert_not_called()
 
     def test_empty_inventory_records_removals(self):
         previous = {"arn:aws:sqs:us-east-1:123456789012:gone": {"Env": "prod"}}
@@ -119,9 +153,48 @@ class TestTagChangeEvent:
 
     def test_sqs_wrapped_event_routed(self):
         import json
-        event = {"Records": [{"body": json.dumps(_tag_event(self.ARN, {"Env": "prod"}))}]}
+        event = {"Records": [{"messageId": "m1", "body": json.dumps(_tag_event(self.ARN, {"Env": "prod"}))}]}
         result, wd, _ = self._run(event, {})
-        assert result["total_deltas"] == 1
+        assert result == {"batchItemFailures": []}
+        assert wd.call_args.args[3][0]["event_name"] == "TagChangeOnResource"
+        assert wd.call_args.args[3][0]["changed_by"] is None
+
+    def test_sqs_batch_reports_only_failed_records(self):
+        import json
+        good = {"messageId": "ok", "body": json.dumps(_tag_event(self.ARN, {"Env": "prod"}))}
+        bad = {"messageId": "bad", "body": "not json"}
+        result, _, _ = self._run({"Records": [bad, good]}, {})
+        assert result == {"batchItemFailures": [{"itemIdentifier": "bad"}]}
+
+
+class TestDeltaPublishing:
+    def test_large_delta_sets_are_chunked_with_one_notification_each(self):
+        deltas = [{"arn": f"arn:aws:sqs:{REGION}:{ACCT}:q{i}"} for i in range(25_001)]
+        with patch.object(worker, "write_deltas", side_effect=lambda *a: f"k{len(a[3])}") as wd, \
+                patch.object(worker, "notify_results_q") as nq:
+            worker.publish_deltas(ACCT, REGION, "scan-1", deltas)
+        assert [len(c.args[3]) for c in wd.call_args_list] == [10_000, 10_000, 5_001]
+        assert [c.args[3] for c in nq.call_args_list] == [10_000, 10_000, 5_001]
+
+    def test_chunks_respect_byte_budget(self):
+        big = {"arn": "x", "tags": {"k": "v" * 1000}}
+        with patch.object(worker, "DELTA_CHUNK_BYTES", 5_000):
+            chunks = worker._chunk_deltas([big] * 12)
+        assert all(len(c) <= 4 for c in chunks) and sum(map(len, chunks)) == 12
+
+    def test_notification_failure_raises_before_state_is_written(self):
+        sqs = MagicMock()
+        sqs.send_message.side_effect = RuntimeError("SQS down")
+        with patch.object(worker, "CENTRAL_RESULTS_QUEUE_URL", "https://sqs.example/q"), \
+                patch.object(worker, "sqs", sqs), \
+                patch.object(worker, "discover_resources_for_account_region",
+                             return_value={f"arn:aws:sqs:{REGION}:{ACCT}:q1": {}}), \
+                patch.object(worker, "read_state", return_value={}), \
+                patch.object(worker, "write_deltas", return_value="k"), \
+                patch.object(worker, "write_state") as ws:
+            with pytest.raises(RuntimeError, match="SQS down"):
+                worker.process_account_region_scan(ACCT, REGION, "scan-1")
+        ws.assert_not_called()
 
 
 def test_delta_keys_unique_within_same_second():

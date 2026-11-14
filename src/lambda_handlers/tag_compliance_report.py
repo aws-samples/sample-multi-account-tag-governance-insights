@@ -34,12 +34,17 @@ SENDER = os.environ.get('SENDER', '')
 RECIPIENTS = [r.strip() for r in os.environ.get('RECIPIENTS', '').split(',') if r.strip()]
 MAX_ROWS = int(os.environ.get('MAX_ROWS', '500'))
 
+SES_MAX_RECIPIENTS = 50  # SendEmail limit across To/Cc/Bcc
+# Violation formats written by tag_compliance_rule.evaluate_tags; the key ends at the first ': ' followed by a verb.
+_VIOLATION = re.compile(r'^(.+?): (?:missing|empty value|invalid \[|duplicates \[)')
+
 config = boto3.client('config')
 ses = boto3.client('ses')
 
 
 def rule_matches(name: str, rule: str) -> bool:
-    return name == rule or name.startswith(f"OrgConfigRule-{rule}-")
+    # The member-account suffix is alphanumeric, so "OrgConfigRule-<rule>-v2-<suffix>" is another rule.
+    return name == rule or re.fullmatch(f"OrgConfigRule-{re.escape(rule)}-[A-Za-z0-9]+", name) is not None
 
 
 def noncompliant_pairs(rule: str) -> List[Dict]:
@@ -73,10 +78,17 @@ def tag_counts(rows: List[Dict]) -> Counter:
     """Count resources per violated tag key, from annotations like 'Env: missing; Owner: invalid [...]'.
 
     A resource with two violations on one key (invalid and duplicates) counts once.
+    Tag keys may contain ':' (aws:..., team:owner), so each '; '-separated violation
+    is split at the ': ' that precedes a known verb from tag_compliance_rule.
     """
     counts = Counter()
     for row in rows:
-        counts.update({k.strip() for k in re.findall(r'(?:^|; )([^:;]+):', row['annotation'])})
+        keys = set()
+        for part in row['annotation'].split('; '):
+            m = _VIOLATION.match(part)
+            if m:
+                keys.add(m.group(1).strip())
+        counts.update(keys)
     return counts
 
 
@@ -115,12 +127,10 @@ def lambda_handler(event, context):
     if not (AGGREGATOR_NAME and RULE_NAME and SENDER and RECIPIENTS):
         raise ValueError("AGGREGATOR_NAME, RULE_NAME, SENDER and RECIPIENTS must be set")
     rows = noncompliant_resources(noncompliant_pairs(RULE_NAME))
-    ses.send_email(
-        Source=SENDER,
-        Destination={'ToAddresses': RECIPIENTS},
-        Message={
-            'Subject': {'Data': f"Tag compliance: {len(rows)} non-compliant resources"},
-            'Body': {'Html': {'Data': render_html(rows)}},
-        },
-    )
+    message = {
+        'Subject': {'Data': f"Tag compliance: {len(rows)} non-compliant resources"},
+        'Body': {'Html': {'Data': render_html(rows)}},
+    }
+    for i in range(0, len(RECIPIENTS), SES_MAX_RECIPIENTS):
+        ses.send_email(Source=SENDER, Destination={'ToAddresses': RECIPIENTS[i:i + SES_MAX_RECIPIENTS]}, Message=message)
     return {'noncompliant': len(rows), 'recipients': len(RECIPIENTS)}

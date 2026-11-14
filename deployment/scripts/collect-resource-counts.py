@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Resource Count Collection Script for TagInsights Cost Calculator
+Resource Count Collection Script for TagInsights sizing
 
-This script uses AWS Resource Explorer to aggregate resource counts by account and region.
-It outputs a CSV file compatible with the TagInsights cost calculator.
+This script uses AWS Resource Explorer to aggregate resource counts by account and region
+and writes them as CSV (account_id, region, resource_count) for sizing a deployment.
 
 Usage:
     python3 collect-resource-counts.py --output resource-counts.csv
@@ -14,8 +14,10 @@ Usage:
 
 Requirements:
     - boto3 and AWS credentials (run in the Resource Explorer aggregator Region)
-    - Resource Explorer enabled with indexes in target regions
-    - IAM permissions: resource-explorer-2:ListResources
+    - Resource Explorer enabled with indexes in target regions, and an org-wide view
+      (found by '/org/' in its ARN, as the Worker does, or passed with --view-arn)
+    - IAM permissions: resource-explorer-2:ListViews and resource-explorer-2:Search
+      (AWS authorizes ListResources with the Search action)
 
 Cost: $0 (Resource Explorer ListResources is free)
 """
@@ -28,26 +30,12 @@ from collections import defaultdict
 from datetime import datetime
 
 
-def parse_arn(arn):
+def resource_location(resource):
     """
-    Extract account_id and region from an ARN.
-    ARN format: arn:partition:service:region:account-id:resource-type/resource-id
-    
-    Returns: (account_id, region) tuple
+    (account_id, region) from Resource Explorer's own fields. ARNs are not parsed:
+    S3 bucket and other global ARNs omit the account and Region.
     """
-    try:
-        parts = arn.split(':')
-        if len(parts) < 6:
-            return None, None
-        
-        partition = parts[1]  # aws, aws-cn, aws-us-gov
-        service = parts[2]
-        region = parts[3] if parts[3] else 'global'
-        account_id = parts[4] if parts[4] else 'unknown'
-        
-        return account_id, region
-    except Exception:
-        return None, None
+    return resource.get('OwningAccountId') or 'unknown', resource.get('Region') or 'global'
 
 
 def build_filter_strings(accounts_filter=None, regions_filter=None):
@@ -63,21 +51,37 @@ def build_filter_strings(accounts_filter=None, regions_filter=None):
     ]
 
 
-def iter_resource_pages(accounts_filter=None, regions_filter=None):
+def find_org_view(client):
+    """
+    First view whose ARN contains '/org/' (same rule as the Worker). Without an
+    explicit view, ListResources uses the Region's default view, which usually
+    covers only this account, so the counts would silently miss member accounts.
+    """
+    for page in client.get_paginator("list_views").paginate():
+        for view_arn in page.get("Views", []):
+            if "/org/" in view_arn:
+                return view_arn
+    sys.exit("No Resource Explorer view with '/org/' in its ARN in this Region. "
+             "Create the org view (docs/DEPLOYMENT.md) or pass --view-arn.")
+
+
+def iter_resource_pages(accounts_filter=None, regions_filter=None, view_arn=None):
     """
     Page through every matching resource with ListResources. (Search is not
     used: it returns at most 1,000 results per query, which undercounts.)
     """
     client = boto3.client("resource-explorer-2")
+    view_arn = view_arn or find_org_view(client)
+    print(f"Using Resource Explorer view: {view_arn}")
     paginator = client.get_paginator("list_resources")
     for filter_string in build_filter_strings(accounts_filter, regions_filter):
-        kwargs = {"MaxResults": 1000}
+        kwargs = {"MaxResults": 1000, "ViewArn": view_arn}
         if filter_string:
             kwargs["Filters"] = {"FilterString": filter_string}
         yield from paginator.paginate(**kwargs)
 
 
-def collect_resource_counts(accounts_filter=None, regions_filter=None):
+def collect_resource_counts(accounts_filter=None, regions_filter=None, view_arn=None):
     """
     Paginate through Resource Explorer results and aggregate counts by (account_id, region).
     Uses constant memory regardless of total resource count.
@@ -91,7 +95,7 @@ def collect_resource_counts(accounts_filter=None, regions_filter=None):
     print("Collecting resource counts from AWS Resource Explorer...")
     print("This may take 5-10 minutes for large environments (100M+ resources)...")
     
-    for response in iter_resource_pages(accounts_filter, regions_filter):
+    for response in iter_resource_pages(accounts_filter, regions_filter, view_arn):
         page_num += 1
         resources = response.get('Resources', [])
         page_count = len(resources)
@@ -101,14 +105,8 @@ def collect_resource_counts(accounts_filter=None, regions_filter=None):
         
         # Aggregate counts in memory
         for resource in resources:
-            arn = resource.get('Arn', '')
-            account_id, region = parse_arn(arn)
-            
-            if account_id and region:
-                key = (account_id, region)
-                counts[key] += 1
+            counts[resource_location(resource)] += 1
 
-    
     print(f"\n✓ Processed {total_resources:,} resources")
     print(f"✓ Found {len(counts)} unique account-region combinations")
     
@@ -118,8 +116,7 @@ def collect_resource_counts(accounts_filter=None, regions_filter=None):
 def write_csv(counts, output_file):
     """
     Write aggregated counts to CSV file.
-    Format: account_id,region,resource_count,monthly_spend
-    (monthly_spend is 0.00 since this is resource count data only)
+    Format: account_id,region,resource_count
     """
     print(f"\nWriting results to {output_file}...")
     
@@ -128,21 +125,17 @@ def write_csv(counts, output_file):
     
     with open(output_file, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['account_id', 'region', 'resource_count', 'monthly_spend'])
-        
+        writer.writerow(['account_id', 'region', 'resource_count'])
+
         for (account_id, region), count in sorted_counts:
-            writer.writerow([account_id, region, count, '0.00'])
-    
+            writer.writerow([account_id, region, count])
+
     print(f"✓ Wrote {len(sorted_counts)} rows to {output_file}")
-    print(f"\nNext steps:")
-    print(f"  1. Upload {output_file} to TagInsights cost calculator")
-    print(f"  2. Review accurate cost estimates based on your actual resource counts")
-    print(f"  3. Download deployment recommendation CSVs")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Collect AWS resource counts for TagInsights cost calculator',
+        description='Collect AWS resource counts per account and Region for TagInsights sizing',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -175,6 +168,11 @@ Examples:
         '--regions',
         help='Comma-separated list of AWS regions to filter (optional)'
     )
+
+    parser.add_argument(
+        '--view-arn',
+        help="Org-wide Resource Explorer view ARN (optional; default: the view with '/org/' in its ARN)"
+    )
     
     args = parser.parse_args()
     
@@ -189,7 +187,7 @@ Examples:
     
     # Collect resource counts
     start_time = datetime.now()
-    counts = collect_resource_counts(accounts_filter, regions_filter)
+    counts = collect_resource_counts(accounts_filter, regions_filter, args.view_arn)
     duration = (datetime.now() - start_time).total_seconds()
     
     # Write to CSV

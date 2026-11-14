@@ -65,7 +65,7 @@ flowchart TD
         AW[Analytics Writer Lambda\nti-analytics-ENV-ACCOUNT]
         MA[Monthly Aggregator Lambda\nti-monthly-agg-ENV-ACCOUNT]
         subgraph Athena["Athena Tables"]
-            T1[resource_tag_deltas_recent\n90 days of daily scans]
+            T1[resource_tag_deltas_recent\nDaily data, about the last 1-2 months]
             T2[resource_tag_deltas_historical\nAggregated monthly data]
         end
     end
@@ -88,40 +88,34 @@ flowchart TD
 ```mermaid
 flowchart TD
     subgraph Inputs["Inputs"]
-        CUR[CUR S3 Bucket\nCost & Usage Report data]
-        TDA[Tag Delta Data\nfrom resource_tag_deltas_recent]
+        CUR[CUR table\nCost & Usage Report data]
+        TDA[Tag history\nresource_tag_deltas_recent + _historical]
     end
 
-    subgraph CostPipeline["Cost Analysis Pipeline (deployment/cost-analysis-stack.yaml)"]
-        CC[Cost Coordinator Lambda\nti-cost-orches-ENV-ACCOUNT\nScheduled every 12h]
-        SQS_COST[FIFO Work Queue\nti-cost-analysis-work-ENV.fifo]
-        CW[Cost Worker Lambda\nti-cost-worker-ENV-ACCOUNT\nMax 50 concurrent, SQS-triggered]
-        SNS[SNS Dedup Trigger Topic]
-        CD[Cost Deduplicator Lambda\nti-cost-dedup-ENV-ACCOUNT\nTriggered by SNS when queue empties]
+    subgraph CostStack["Cost Analysis (deployment/cost-analysis-stack.yaml)"]
+        SCH[EventBridge Scheduler\ncron 0 6 * * ? *]
+        CA[Cost Allocator Lambda\nti-cost-alloc-ENV-ACCOUNT]
     end
 
     subgraph Output["Output"]
-        TC[tag-costs/ Parquet\nin Central Analytics S3]
-        AT[tag_costs Athena Table]
+        S3[tag-cost-allocation/year=Y/month=M/\nParquet in Central Analytics S3]
+        AT[tag_cost_allocation Athena Table\npartition projection]
     end
 
-    CUR -->|Match ARNs to cost data| CC
-    TDA -->|Resource ARNs| CC
-    CC -->|Dispatch work batches to FIFO queue| SQS_COST
-    SQS_COST -->|Trigger| CW
-    CW -->|Write cost records| TC
-    TC -->|Queue empty → SNS → deduplicate| SNS
-    SNS -->|Trigger| CD
-    TC --> AT
+    SCH -->|Daily| CA
+    CA -->|One Athena UNLOAD per month| CUR
+    CA --> TDA
+    CUR -->|Join usage hour to tags valid then| S3
+    TDA --> S3
+    S3 --> AT
 ```
 
 **Key design notes:**
 
-- Work queue is **FIFO** with content-based deduplication (prevents duplicate work)
-- **Deduplication triggered via SNS topic** when queue depth reaches 0
-- **`EnableCostExplorerFallback=false` by default** — opt-in required for CE fallback (prevents unexpected $0.01/request
-  charges)
-- **`CurAccountRoleArn` parameter** — cross-account CUR access via STS AssumeRole
+- One Lambda, no queues. Each run recomputes the current and previous month, or one `{"year", "month"}` from the event.
+- Each month is one Athena `UNLOAD` that replaces `tag-cost-allocation/year=Y/month=M/`.
+- **`CurCatalogAccountId` parameter** — cross-account CUR through the billing account's Glue Data Catalog,
+  registered in Athena as `<ProjectName>_cur_<Environment>`
 
 ---
 
@@ -129,7 +123,7 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-    subgraph Daily["Daily (rolling 90 days)"]
+    subgraph Daily["Daily (about the last 1-2 months)"]
         R[tag-deltas/recent/\nPartitioned by\naccount/year/month/day]
     end
 
@@ -138,15 +132,16 @@ flowchart LR
     end
 
     subgraph Lifecycle["Lifecycle Rules"]
-        D95[Delete after 95 days]
+        D130[Safety-net expiry\nafter 130 days]
         IA[Transition to IA\nafter 90 days]
     end
 
     MA[Monthly Aggregator\nRuns day 2 of each month]
 
-    R -->|Monthly aggregation| MA
-    MA -->|Compressed monthly records| H
-    R -.->|Auto-expire| D95
+    R -->|Month that ended 28+ days ago| MA
+    MA -->|Athena UNLOAD| H
+    MA -->|Deletes compacted daily partitions| R
+    R -.->|Auto-expire| D130
     H -.->|Cost optimization| IA
 ```
 
@@ -164,11 +159,14 @@ flowchart LR
 
 1. Reads `aggregator-state/scan-checkpoint.json` from S3 — resumes in-progress cycle or starts new one (`scan_id` =
    today's date)
-2. Discovers all org accounts via AWS Organizations API
+2. Discovers all org accounts with `organizations:ListAccounts`. The hub must be the management account or a delegated
+   administrator; otherwise the Coordinator raises an error instead of scanning only the hub.
 3. Cross-products all org accounts × hub regions to build the work list
 4. **Sequential scan** (default): invokes Worker synchronously per pair, saves checkpoint every 10 completions; stops
    and saves checkpoint before Lambda timeout
-5. **Fan-out mode** (if scan age ≥ `MAX_SCAN_DAYS`): invokes all remaining Workers asynchronously in parallel
+5. **Fan-out mode** (if scan age ≥ `MAX_SCAN_DAYS`): invokes all remaining Workers asynchronously in parallel, then
+   closes the cycle so the next run starts a fresh one. Async invocations that fail after retries go to the
+   `ti-worker-failures-ENV` queue, which has an alarm of the same name.
 6. On full completion: writes completion marker, deletes checkpoint
 
 **Manual trigger:**
@@ -191,7 +189,8 @@ aws lambda invoke \
 
 **What it does:**
 
-1. Locates the org-wide Resource Explorer view (ARN contains `/org/`)
+1. Locates the org-wide Resource Explorer view (`OrgViewArn`, or a view whose ARN contains `/org/`). If there is none,
+   member-account scans raise an error instead of returning empty results.
 2. Lists every resource in the account+Region with Resource Explorer `ListResources` (filter `accountid:{account} region:{region}`; Search would cap at 1,000 results)
 3. Extracts tags inline from RE response `Properties[name=tags].Data` — no secondary API calls
 4. Reads previous state from `aggregator-state/account_id={account}/region={region}/latest.json.gz`
@@ -201,7 +200,9 @@ aws lambda invoke \
 8. Sends notification to `ti-central-results-ENV-ACCOUNT` SQS queue to trigger Analytics Writer
 
 **Real-time path** (EventBridge CloudTrail rule): extracts ARNs from CloudTrail event payload, updates only affected
-resources.
+resources. These deltas have `change_type` `tags_changed` (or `new_resource`), `event_name` (the API name), and
+`changed_by` (the CloudTrail `userIdentity` ARN). Native `aws.tag` events have `event_name` `TagChangeOnResource` and a
+NULL `changed_by`; scan deltas have both NULL. Every CloudTrail tag API call also writes one row per resource to `tag_change_events` (`tag-change-events/` prefix: caller ARN, API name, tags set or removed), even when the native event already updated state, so who made a change is kept apart from the change-only delta history.
 
 **Manual trigger (scan path):**
 
@@ -249,10 +250,15 @@ aws lambda invoke \
 
 **What it does:**
 
-1. Discovers accounts with data for the target month (S3 listing, Athena fallback)
-2. Aggregates daily records into monthly summaries: `first_seen`, `last_seen`, `change_count`
-3. Writes aggregated Parquet to `tag-deltas/historical/account_id=X/year=Y/month=M/`
-4. Deletes aggregated daily Glue partitions and S3 data
+1. Picks the target month: the most recent calendar month that ended at least 28 days before the run (a run on
+   November 2 compacts September). An event with `{"year": Y, "month": M}` picks that month instead.
+2. Lists the month's daily partitions in Glue and skips accounts already compacted
+3. Runs Athena `UNLOAD` (up to 100 accounts per query) into `tag-deltas/historical/account_id=X/year=Y/month=M/`,
+   one row per resource with `first_seen_timestamp`, `last_seen_timestamp`, `change_count`, `changed_by`, `event_name`
+4. Only after every `UNLOAD` succeeds, deletes the month's daily Glue partitions and S3 objects. Any failure raises an
+   error and fires `ti-monthly-agg-errors-ENV`.
+
+A failed month must be rerun by hand before its `tag-deltas/recent/` objects expire at 130 days.
 
 **Manual trigger:**
 
@@ -260,69 +266,42 @@ aws lambda invoke \
 aws lambda invoke \
   --function-name ti-monthly-agg-prod-ACCOUNT_ID \
   --cli-binary-format raw-in-base64-out \
-  --payload '{"trigger_source": "manual"}' \
+  --payload '{"year": 2026, "month": 9}' \
   /tmp/response.json --profile ${AWS_PROFILE}
 ```
 
 ---
 
-### Cost Coordinator
+### Cost Allocator
 
-**Function:** `ti-cost-orches-{ENV}-{ACCOUNT_ID}` (if `EnableCostAnalysis=true`)  
+**Function:** `ti-cost-alloc-{ENV}-{ACCOUNT_ID}` (if `EnableCostAnalysis=true`)  
 **Account:** Hub account  
-**Trigger:** EventBridge every 12 hours
+**Trigger:** EventBridge Scheduler, daily at 06:00 UTC (`cron(0 6 * * ? *)`)
 
 **What it does:**
 
-1. Reads resource ARNs from tag delta data
-2. Dispatches batches to FIFO work queue (`ti-cost-analysis-work-ENV.fifo`)
-3. Cost Workers pick up batches and match ARNs against CUR data via Athena
-4. When queue drains to 0, SNS topic fires → triggers Deduplicator
+1. Picks the months to compute: current and previous UTC month, or the `{"year", "month"}` in the event
+2. Builds each resource's tag history as time intervals from the tag delta tables
+3. Joins hourly CUR `Usage` line items to the tags valid at that hour, in one Athena `UNLOAD` per month
+4. Writes Parquet to `tag-cost-allocation/year=Y/month=M/`, read by the `tag_cost_allocation` table
 
 **Manual trigger:**
 
 ```bash
 aws lambda invoke \
-  --function-name ti-cost-orches-prod-ACCOUNT_ID \
+  --function-name ti-cost-alloc-prod-ACCOUNT_ID \
   --cli-binary-format raw-in-base64-out \
-  --payload '{"trigger_source": "manual", "lookback_hours": 12}' \
+  --payload '{"year": 2026, "month": 9}' \
   /tmp/response.json --profile ${AWS_PROFILE}
 ```
+
+Omit `--payload` to recompute the current and previous month.
 
 **Prerequisites:**
 
 - CUR configured in AWS Billing with resource IDs and Athena integration
 - `CurDatabaseName` + `CurTableName` stack parameters set
-- For cross-account CUR: `CurAccountRoleArn` parameter set (see [cost-analysis/README.md](cost-analysis/README.md))
-
----
-
-### Cost Worker
-
-**Function:** `ti-cost-worker-{ENV}-{ACCOUNT_ID}` (if `EnableCostAnalysis=true`)  
-**Account:** Hub account  
-**Trigger:** FIFO SQS work queue (event source mapping, batch size 5, max concurrency 50)
-
-**What it does:**
-
-1. Receives batch of resource ARNs from FIFO queue
-2. Normalizes ARNs to CUR `line_item_resource_id` format (service-specific)
-3. Queries CUR Athena table for cost data
-4. Writes results as Parquet to `tag-costs/`
-
----
-
-### Cost Deduplicator
-
-**Function:** `ti-cost-dedup-{ENV}-{ACCOUNT_ID}` (if `EnableCostAnalysis=true`)  
-**Account:** Hub account  
-**Trigger:** SNS topic subscription (triggered when cost work queue empties)
-
-**What it does:**
-
-1. Scans `tag-costs/` for duplicate records from overlapping runs
-2. Uses Athena CTAS deduplication
-3. Retains most recent version of each resource's cost data
+- For cross-account CUR: `CurCatalogAccountId` parameter set and billing-account grants applied (see [cost-analysis/README.md](cost-analysis/README.md#cross-account-cur-setup))
 
 ---
 
@@ -350,7 +329,8 @@ aws s3 cp s3://ti-central-analytics-${REGION}-${ENV}-${HUB_ACCOUNT}/aggregator-s
 echo "Waiting 5 minutes for Analytics Writer to process..."
 sleep 300
 
-# Step 4: Register Athena partitions
+# Step 4: Partitions are registered by the Analytics Writer as files land.
+# Run this only to recover from a failed registration (results DLQ).
 aws athena start-query-execution \
   --query-string "MSCK REPAIR TABLE resource_tag_deltas_recent" \
   --query-execution-context "Database=ti_${REGION}_${ENV}_${HUB_ACCOUNT}" \
@@ -366,13 +346,11 @@ aws athena start-query-execution \
   --region ${REGION} \
   --profile ${AWS_PROFILE}
 
-# Step 6: Trigger cost analysis (if EnableCostAnalysis=true)
+# Step 6: Run the cost allocator (if EnableCostAnalysis=true)
 aws lambda invoke \
-  --function-name ti-cost-orches-${ENV}-${HUB_ACCOUNT} \
+  --function-name ti-cost-alloc-${ENV}-${HUB_ACCOUNT} \
   --region ${REGION} \
-  --cli-binary-format raw-in-base64-out \
-  --payload '{"trigger_source": "manual", "lookback_hours": 24}' \
-  /tmp/step6.json --profile ${AWS_PROFILE} && echo "Cost analysis started" && cat /tmp/step6.json
+  /tmp/step6.json --profile ${AWS_PROFILE} && echo "Cost allocation finished" && cat /tmp/step6.json
 ```
 
 ---
@@ -394,8 +372,8 @@ aws logs tail /aws/lambda/ti-analytics-prod-ACCOUNT --since 1h --profile ${AWS_P
 # Monthly Aggregator (hub account)
 aws logs tail /aws/lambda/ti-monthly-agg-prod-ACCOUNT --since 24h --profile ${AWS_PROFILE}
 
-# Cost Coordinator (hub account)
-aws logs tail /aws/lambda/ti-cost-orches-prod-ACCOUNT --since 1h --profile ${AWS_PROFILE}
+# Cost Allocator (hub account)
+aws logs tail /aws/lambda/ti-cost-alloc-prod-ACCOUNT --since 1d --profile ${AWS_PROFILE}
 ```
 
 Check scan checkpoint progress:
@@ -411,15 +389,6 @@ Check SQS queue depth (should drain to 0 after Analytics Writer processes):
 ```bash
 aws sqs get-queue-attributes \
   --queue-url https://sqs.us-east-1.amazonaws.com/ACCOUNT/ti-central-results-prod-ACCOUNT \
-  --attribute-names ApproximateNumberOfMessages,ApproximateNumberOfMessagesNotVisible \
-  --profile ${AWS_PROFILE}
-```
-
-Check cost analysis FIFO queue:
-
-```bash
-aws sqs get-queue-attributes \
-  --queue-url https://sqs.us-east-1.amazonaws.com/ACCOUNT/ti-cost-analysis-work-prod.fifo \
   --attribute-names ApproximateNumberOfMessages,ApproximateNumberOfMessagesNotVisible \
   --profile ${AWS_PROFILE}
 ```

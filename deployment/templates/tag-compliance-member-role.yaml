@@ -3,6 +3,9 @@ Description: >
   TagInsights - Tag Compliance member role. Deploy to every account in the organization
   (service-managed StackSet; also deploy as a plain stack in the management account if the
   rule evaluates it). Lets the hub tag-compliance rule Lambda write evaluations into this account.
+  IAM is global and the role name has no Region: deploy ONE StackSet instance per account
+  (a single StackSet Region). The role serves every Region the rule evaluates, because it
+  trusts the hub rule role in any Region.
 
 Parameters:
   ProjectName:

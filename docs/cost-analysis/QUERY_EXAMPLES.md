@@ -1,211 +1,173 @@
 # TagInsights Cost Analysis Query Examples
 
-SQL query patterns for tag-based cost allocation, missing-tag cost impact, and
-cost trends.
+SQL query patterns for cost by tag, missing-tag cost, and cost per resource.
 
-> **Requires `EnableCostAnalysis=true`.** These queries use the `tag_costs`
-> table, which is populated only after the Cost Analysis pipeline runs. For
-> core tagging-gap queries, use [USAGE.md](../USAGE.md).
+> **Requires `EnableCostAnalysis=true`.** These queries use the
+> `tag_cost_allocation` table, which the cost allocator Lambda function fills
+> daily. For core tagging-gap queries, use
+> [USAGE.md](../USAGE.md).
 
 > **How to use these queries:** In Athena, select the workgroup
 > `ti-REGION-ENV-ACCOUNT` and replace `"ti_REGION_ENV_ACCOUNT"` in the queries
 > below with your actual database name, keeping the double quotes (e.g.,
-> `"ti_us-east-1_prod_123456789012"`). The name contains hyphens, so Athena
+> `"ti_us-east-1_prod_111122223333"`). The name contains hyphens, so Athena
 > rejects it unquoted with `mismatched input '-'`.
-> Find it with: `aws glue list-databases --query 'DatabaseList[?starts_with(Name,\`ti_\`)].Name'`
+> Find it with: `aws glue list-databases --query "DatabaseList[?starts_with(Name, 'ti_')].Name"`
 
-## How `tag_costs` Is Shaped
+## Cost by tag from `tag_cost_allocation`
+
+`tag_cost_allocation` is a history-aware cost view. A daily
+allocator joins AWS Cost and Usage Report (CUR) usage line items to the tags
+that were on each resource at the hour the cost was incurred, so it covers
+tags that are not activated as cost allocation tags and tags that changed
+during the month. For how the allocation works, see
+[How cost allocation works](README.md#how-cost-allocation-works).
 
 | Column | Type | Notes |
 |---|---|---|
-| `tag_key`, `tag_value` | STRING | One row per tag on the resource |
-| `is_cost_allocation_tag` | BOOLEAN | Whether the key is an activated cost allocation tag |
-| `resource_arn`, `resource_type`, `region` | STRING | Resource identifiers |
-| `current_month_mtd` | DOUBLE | Current month cost to date, from CUR. Repeated on each of the resource's tag rows |
-| `avg_daily_cost`, `current_month_projected` | DOUBLE | `current_month_mtd` / day of month, and that × days in month |
-| `last_month_cost` | DOUBLE | **Not populated yet (always 0).** Month-over-month queries below return no rows until it is |
-| `analysis_date` | DATE | Date of the Cost Analysis run |
-| `last_updated` | TIMESTAMP | Write time |
-| `account_id`, `year`, `month` | Partition keys | `year`/`month` are INT |
+| `account_id`, `resource_arn`, `resource_type`, `region` | STRING | Resource identifiers |
+| `usage_date` | DATE | Day the cost was incurred |
+| `tag_key` | STRING | One tag key on the resource. NULL for untagged resources |
+| `tag_value` | STRING | Value of `tag_key` at that time. NULL for untagged resources |
+| `tags_assumed` | BOOLEAN | `true` when the cost was incurred before TagInsights first observed the resource, so the row uses the first-observed tags |
+| `cost` | DOUBLE | Cost for the resource, day, and tag: unblended for `Usage` lines, effective cost for `SavingsPlanCoveredUsage` and `DiscountedUsage` lines |
+| `year`, `month` | INT | Partition keys (partition projection, no `MSCK REPAIR` needed) |
 
-Three things matter when aggregating:
+> **Important: filter to one `tag_key` before you `SUM(cost)`.** Each row
+> repeats the resource's cost once per tag key. A resource with five tags
+> appears five times per day, so summing across all keys over-counts its cost
+> five times. Either filter to a single `tag_key`, or deduplicate to one row
+> per resource and day first, as the [total cost per resource](#total-cost-per-resource)
+> query shows.
 
-1. **Each resource appears once per tag.** Never `SUM` cost across all rows;
-   either filter to one `tag_key` or collapse to one row per `resource_arn`
-   with `MAX(...)` first.
-2. **Each run adds a new snapshot to the month partition.** Filter to the
-   latest `analysis_date` so a month is not counted once per run.
-3. **Untagged resources are not in `tag_costs`.** Only resources with at least
-   one tag are written, so the "missing tag" queries below find resources
-   missing a *specific* tag.
+### Cost by tag value for a month
 
-Every query below starts from the same `latest` CTE (current month, latest
-run). Queries that need one row per resource add a `resources` CTE.
-
-## Table of Contents
-
-- [Tag-Based Cost Analysis](#tag-based-cost-analysis)
-- [Missing-Tag Cost Analysis](#missing-tag-cost-analysis)
-- [Cost Trend Analysis](#cost-trend-analysis)
-- [Resource Optimization Queries](#resource-optimization-queries)
-- [BI Tool Integration](#bi-tool-integration)
-- [Query Performance Best Practices](#query-performance-best-practices)
-
-## Tag-Based Cost Analysis
-
-### Environment-Based Cost Allocation
+Works for any tag key, including keys that are not activated as cost
+allocation tags.
 
 ```sql
--- Cost breakdown by environment and service
-WITH latest AS (
-    SELECT * FROM "ti_REGION_ENV_ACCOUNT".tag_costs
-    WHERE year = YEAR(CURRENT_DATE) AND month = MONTH(CURRENT_DATE)
-      AND analysis_date = (
-          SELECT MAX(analysis_date) FROM "ti_REGION_ENV_ACCOUNT".tag_costs
-          WHERE year = YEAR(CURRENT_DATE) AND month = MONTH(CURRENT_DATE))
-)
+-- Last month's cost by BusinessLine
 SELECT
-    tag_value AS environment,
-    split_part(resource_arn, ':', 3) AS service,
-    COUNT(DISTINCT resource_arn) AS resource_count,
-    SUM(current_month_projected) AS total_cost,
-    ROUND(AVG(current_month_projected), 2) AS avg_resource_cost,
-    MAX(current_month_projected) AS max_resource_cost
-FROM latest
-WHERE tag_key = 'Environment'
-GROUP BY tag_value, split_part(resource_arn, ':', 3)
-ORDER BY total_cost DESC;
+    tag_value AS business_line,
+    ROUND(SUM(cost), 2) AS cost
+FROM "ti_REGION_ENV_ACCOUNT".tag_cost_allocation
+WHERE tag_key = 'BusinessLine'
+  AND year = YEAR(date_add('month', -1, CURRENT_DATE))
+  AND month = MONTH(date_add('month', -1, CURRENT_DATE))
+GROUP BY 1
+ORDER BY 2 DESC;
 ```
 
-**Use case:** Allocate AWS spending to development, staging, and production environments.
+This query returns only resources that have the key. To find the cost of
+resources without it, use [cost of resources missing a tag](#cost-of-resources-missing-a-tag).
 
-### Project-Based Cost Tracking
+### Cost by tag value for a quarter
 
 ```sql
--- Project costs with owner information
-WITH latest AS (
-    SELECT * FROM "ti_REGION_ENV_ACCOUNT".tag_costs
-    WHERE year = YEAR(CURRENT_DATE) AND month = MONTH(CURRENT_DATE)
-      AND analysis_date = (
-          SELECT MAX(analysis_date) FROM "ti_REGION_ENV_ACCOUNT".tag_costs
-          WHERE year = YEAR(CURRENT_DATE) AND month = MONTH(CURRENT_DATE))
-)
+-- Replace the year and months with the quarter you want (here, Q3 2026)
 SELECT
-    p.tag_value AS project,
-    o.tag_value AS owner,
-    COUNT(DISTINCT p.resource_arn) AS resource_count,
-    SUM(p.current_month_projected) AS project_cost,
-    ROUND(AVG(p.current_month_projected), 2) AS avg_cost_per_resource
-FROM latest p
-LEFT JOIN latest o
-  ON p.resource_arn = o.resource_arn
-  AND o.tag_key = 'Owner'
-WHERE p.tag_key = 'Project'
-GROUP BY p.tag_value, o.tag_value
-ORDER BY project_cost DESC;
+    tag_value AS business_line,
+    month,
+    ROUND(SUM(cost), 2) AS cost
+FROM "ti_REGION_ENV_ACCOUNT".tag_cost_allocation
+WHERE tag_key = 'BusinessLine'
+  AND year = 2026
+  AND month IN (7, 8, 9)
+GROUP BY 1, 2
+ORDER BY 1, 2;
 ```
 
-**Use case:** Track spending per project and identify project owners for cost accountability.
+Remove `month` from the `SELECT` and `GROUP BY` for one total per value.
 
-### Cost Center Allocation
+### Cost of resources missing a tag
 
-```sql
--- Cost center breakdown with month-over-month change
-WITH latest AS (
-    SELECT * FROM "ti_REGION_ENV_ACCOUNT".tag_costs
-    WHERE year = YEAR(CURRENT_DATE) AND month = MONTH(CURRENT_DATE)
-      AND analysis_date = (
-          SELECT MAX(analysis_date) FROM "ti_REGION_ENV_ACCOUNT".tag_costs
-          WHERE year = YEAR(CURRENT_DATE) AND month = MONTH(CURRENT_DATE))
-)
-SELECT
-    tag_value AS cost_center,
-    split_part(resource_arn, ':', 3) AS service,
-    account_id,
-    region,
-    COUNT(*) AS resource_count,
-    SUM(current_month_projected) AS monthly_cost,
-    SUM(last_month_cost) AS previous_month_cost,
-    ROUND(
-        ((SUM(current_month_projected) - SUM(last_month_cost)) / NULLIF(SUM(last_month_cost), 0)) * 100,
-        2
-    ) AS cost_change_percent
-FROM latest
-WHERE tag_key = 'CostCenter'
-GROUP BY tag_value, split_part(resource_arn, ':', 3), account_id, region
-ORDER BY monthly_cost DESC;
-```
-
-**Use case:** Financial reporting for cost center chargebacks and budget tracking.
-
-### Multi-Tag Cost Analysis
+Counts each resource and day once, whether the resource has other tags or no
+tags at all. A resource and day count as tagged when the key was present for
+any part of that day.
 
 ```sql
--- Analyze costs across multiple tag dimensions
-WITH latest AS (
-    SELECT * FROM "ti_REGION_ENV_ACCOUNT".tag_costs
-    WHERE year = YEAR(CURRENT_DATE) AND month = MONTH(CURRENT_DATE)
-      AND analysis_date = (
-          SELECT MAX(analysis_date) FROM "ti_REGION_ENV_ACCOUNT".tag_costs
-          WHERE year = YEAR(CURRENT_DATE) AND month = MONTH(CURRENT_DATE))
+-- Last month's cost of resources with no BusinessLine tag, by resource type
+WITH per_key AS (
+    SELECT resource_arn, resource_type, usage_date, tag_key, SUM(cost) AS cost
+    FROM "ti_REGION_ENV_ACCOUNT".tag_cost_allocation
+    WHERE year = YEAR(date_add('month', -1, CURRENT_DATE))
+      AND month = MONTH(date_add('month', -1, CURRENT_DATE))
+    GROUP BY resource_arn, resource_type, usage_date, tag_key
 ),
-tagged_resources AS (
+per_resource_day AS (
     SELECT
         resource_arn,
-        MAX(CASE WHEN tag_key = 'Environment' THEN tag_value END) AS environment,
-        MAX(CASE WHEN tag_key = 'Project' THEN tag_value END) AS project,
-        MAX(CASE WHEN tag_key = 'Team' THEN tag_value END) AS team,
-        MAX(CASE WHEN tag_key = 'CostCenter' THEN tag_value END) AS cost_center,
-        MAX(current_month_projected) AS cost
-    FROM latest
-    WHERE tag_key IN ('Environment', 'Project', 'Team', 'CostCenter')
-    GROUP BY resource_arn
+        resource_type,
+        usage_date,
+        MAX(cost) AS cost,
+        COUNT_IF(tag_key = 'BusinessLine') > 0 AS has_tag
+    FROM per_key
+    GROUP BY resource_arn, resource_type, usage_date
 )
 SELECT
-    environment,
-    project,
-    team,
-    cost_center,
-    COUNT(*) AS resource_count,
-    SUM(cost) AS total_cost,
-    ROUND(AVG(cost), 2) AS avg_cost
-FROM tagged_resources
-WHERE environment IS NOT NULL
-GROUP BY environment, project, team, cost_center
-ORDER BY total_cost DESC
-LIMIT 50;
+    resource_type,
+    COUNT(DISTINCT resource_arn) AS resources,
+    ROUND(SUM(cost), 2) AS missing_tag_cost
+FROM per_resource_day
+WHERE NOT has_tag
+GROUP BY resource_type
+ORDER BY missing_tag_cost DESC;
 ```
 
-**Use case:** Multi-dimensional cost analysis for complex organizational structures.
+### Total cost per resource
 
-### Multi-Value Tag Cost Split (Shared Resources)
-
-A shared resource tagged `CustomerName = ACME+GLOBEX` is one CUR line item. CUR,
-Cost Categories split charges, and split cost allocation data can't divide one
-resource's cost by the entries of a multi-value tag; this query splits it evenly.
-Use `+` (or `:`) as the delimiter: S3 rejects commas in tag values.
+Deduplicates across tag keys: `per_key` sums each key's rows for the day
+(a key whose value changed during the day has one row per value), and
+`MAX` keeps one cost per resource and day.
 
 ```sql
--- Even split of each resource's cost across the customers in a multi-value tag.
--- Entries are trimmed, de-duplicated, and empty entries (e.g. a trailing '+')
--- dropped BEFORE dividing, so the allocated total always equals the input cost.
-WITH latest AS (
-    SELECT * FROM "ti_REGION_ENV_ACCOUNT".tag_costs
-    WHERE year = YEAR(CURRENT_DATE) AND month = MONTH(CURRENT_DATE)
-      AND analysis_date = (
-          SELECT MAX(analysis_date) FROM "ti_REGION_ENV_ACCOUNT".tag_costs
-          WHERE year = YEAR(CURRENT_DATE) AND month = MONTH(CURRENT_DATE))
+-- Top 20 resources by last month's cost
+WITH per_key AS (
+    SELECT resource_arn, usage_date, tag_key, SUM(cost) AS cost
+    FROM "ti_REGION_ENV_ACCOUNT".tag_cost_allocation
+    WHERE year = YEAR(date_add('month', -1, CURRENT_DATE))
+      AND month = MONTH(date_add('month', -1, CURRENT_DATE))
+    GROUP BY resource_arn, usage_date, tag_key
 ),
-shared AS (
-    SELECT resource_arn, current_month_mtd,
-           array_distinct(filter(transform(split(tag_value, '+'), x -> trim(x)), x -> x <> '')) AS customers
-    FROM latest
+per_resource_day AS (
+    SELECT resource_arn, usage_date, MAX(cost) AS cost
+    FROM per_key
+    GROUP BY resource_arn, usage_date
+)
+SELECT
+    resource_arn,
+    ROUND(SUM(cost), 2) AS cost
+FROM per_resource_day
+GROUP BY resource_arn
+ORDER BY cost DESC
+LIMIT 20;
+```
+
+If a resource's set of tag keys changes during a day, `MAX` can understate
+that day's cost. For exact per-resource totals, query CUR directly.
+
+### Multi-value tag split
+
+Splits each resource's cost evenly across the entries of a multi-value tag
+such as `CustomerName = ACME+GLOBEX`.
+
+```sql
+-- Entries are trimmed, de-duplicated, and empty entries dropped BEFORE
+-- dividing, so each resource's allocations sum to its cost.
+WITH shared AS (
+    SELECT
+        resource_arn,
+        cost,
+        array_distinct(filter(transform(split(tag_value, '+'), x -> trim(x)), x -> x <> '')) AS customers
+    FROM "ti_REGION_ENV_ACCOUNT".tag_cost_allocation
     WHERE tag_key = 'CustomerName'
+      AND year = YEAR(date_add('month', -1, CURRENT_DATE))
+      AND month = MONTH(date_add('month', -1, CURRENT_DATE))
 )
 SELECT
     customer,
-    COUNT(DISTINCT resource_arn) AS shared_resources,
-    ROUND(SUM(current_month_mtd / CARDINALITY(customers)), 2) AS allocated_cost
+    COUNT(DISTINCT resource_arn) AS resources,
+    ROUND(SUM(cost / CARDINALITY(customers)), 2) AS allocated_cost
 FROM shared
 CROSS JOIN UNNEST(customers) AS t(customer)
 WHERE CARDINALITY(customers) > 0
@@ -213,16 +175,34 @@ GROUP BY customer
 ORDER BY allocated_cost DESC;
 ```
 
-**Use case:** Charge back shared infrastructure to each customer listed on it.
-For weighted splits, join a `customer_weights` table instead of dividing by
-`CARDINALITY`.
+### Share of cost on assumed tags
 
-### Current Tag State (One Row per Resource)
+Shows how much of each value's cost uses first-observed tags
+(`tags_assumed = true`) rather than tags recorded at the time.
+
+```sql
+SELECT
+    tag_value AS business_line,
+    ROUND(SUM(cost), 2) AS cost,
+    ROUND(SUM(IF(tags_assumed, cost, 0)), 2) AS assumed_cost,
+    ROUND(100.0 * SUM(IF(tags_assumed, cost, 0)) / NULLIF(SUM(cost), 0), 1) AS assumed_pct
+FROM "ti_REGION_ENV_ACCOUNT".tag_cost_allocation
+WHERE tag_key = 'BusinessLine'
+  AND year = YEAR(date_add('month', -1, CURRENT_DATE))
+  AND month = MONTH(date_add('month', -1, CURRENT_DATE))
+GROUP BY 1
+ORDER BY 2 DESC;
+```
+
+A high `assumed_pct` means most of the period predates TagInsights. For
+periods before deployment, see [How cost allocation works](README.md#how-cost-allocation-works).
+
+## Current tag state (one row per resource)
 
 The delta tables hold change events, not resources: a resource with three
 tag changes has three rows, and a `resource_removed` row can follow earlier
 rows. Count resources from the latest row per ARN, across both the daily
-(last 90 days) and monthly-compacted tables. This query does not need Cost
+(roughly the last one to two months) and monthly-compacted tables. This query does not need Cost
 Analysis.
 
 ```sql
@@ -252,403 +232,6 @@ ORDER BY coverage_pct ASC;
 
 **Use case:** Org-wide tag coverage, and the impact of enforcing a key before
 you enforce it (swap `'Environment'` for that key).
-
-## Missing-Tag Cost Analysis
-
-### High-Cost Resources Missing Required Tags
-
-```sql
--- Expensive resources missing Environment, Project, or Owner
-WITH latest AS (
-    SELECT * FROM "ti_REGION_ENV_ACCOUNT".tag_costs
-    WHERE year = YEAR(CURRENT_DATE) AND month = MONTH(CURRENT_DATE)
-      AND analysis_date = (
-          SELECT MAX(analysis_date) FROM "ti_REGION_ENV_ACCOUNT".tag_costs
-          WHERE year = YEAR(CURRENT_DATE) AND month = MONTH(CURRENT_DATE))
-),
-resources AS (
-    SELECT
-        resource_arn,
-        split_part(resource_arn, ':', 3) AS service,
-        resource_type,
-        account_id,
-        region,
-        MAX(current_month_projected) AS current_month_projected,
-        MAX(last_month_cost) AS last_month_cost,
-        map_agg(tag_key, tag_value) AS tags
-    FROM latest
-    GROUP BY resource_arn, resource_type, account_id, region
-)
-SELECT
-    resource_arn,
-    service,
-    resource_type,
-    account_id,
-    region,
-    current_month_projected AS monthly_cost,
-    COALESCE(element_at(tags, 'Name'), 'Unnamed') AS resource_name,
-    tags
-FROM resources
-WHERE current_month_projected > 50
-  AND (
-    element_at(tags, 'Environment') IS NULL
-    OR element_at(tags, 'Project') IS NULL
-    OR element_at(tags, 'Owner') IS NULL
-  )
-ORDER BY current_month_projected DESC
-LIMIT 100;
-```
-
-**Use case:** Identify costly resources that need tagging for proper cost allocation.
-
-### Missing-Tag Cost by Service
-
-```sql
--- Cost impact of incomplete tagging by service
-WITH latest AS (
-    SELECT * FROM "ti_REGION_ENV_ACCOUNT".tag_costs
-    WHERE year = YEAR(CURRENT_DATE) AND month = MONTH(CURRENT_DATE)
-      AND analysis_date = (
-          SELECT MAX(analysis_date) FROM "ti_REGION_ENV_ACCOUNT".tag_costs
-          WHERE year = YEAR(CURRENT_DATE) AND month = MONTH(CURRENT_DATE))
-),
-resources AS (
-    SELECT
-        resource_arn,
-        split_part(resource_arn, ':', 3) AS service,
-        MAX(current_month_projected) AS current_month_projected,
-        map_agg(tag_key, tag_value) AS tags
-    FROM latest
-    GROUP BY resource_arn
-),
-tagging AS (
-    SELECT
-        service,
-        current_month_projected,
-        CASE
-            WHEN element_at(tags, 'Environment') IS NULL THEN 'Missing Environment'
-            WHEN element_at(tags, 'Project') IS NULL THEN 'Missing Project'
-            WHEN element_at(tags, 'Owner') IS NULL THEN 'Missing Owner'
-            ELSE 'Fully Tagged'
-        END AS tagging_status
-    FROM resources
-)
-SELECT
-    service,
-    tagging_status,
-    COUNT(*) AS resource_count,
-    SUM(current_month_projected) AS total_cost,
-    ROUND(AVG(current_month_projected), 2) AS avg_cost_per_resource
-FROM tagging
-WHERE tagging_status <> 'Fully Tagged'
-GROUP BY service, tagging_status
-ORDER BY total_cost DESC;
-```
-
-**Use case:** Quantify the cost impact of incomplete tagging by service.
-
-### Required-Tag Coverage Cost Impact
-
-```sql
--- Share of cost on resources carrying all required tags
-WITH latest AS (
-    SELECT * FROM "ti_REGION_ENV_ACCOUNT".tag_costs
-    WHERE year = YEAR(CURRENT_DATE) AND month = MONTH(CURRENT_DATE)
-      AND analysis_date = (
-          SELECT MAX(analysis_date) FROM "ti_REGION_ENV_ACCOUNT".tag_costs
-          WHERE year = YEAR(CURRENT_DATE) AND month = MONTH(CURRENT_DATE))
-),
-resources AS (
-    SELECT
-        resource_arn,
-        MAX(current_month_projected) AS current_month_projected,
-        map_agg(tag_key, tag_value) AS tags
-    FROM latest
-    GROUP BY resource_arn
-),
-tag_coverage AS (
-    SELECT
-        CASE
-            WHEN element_at(tags, 'Environment') IS NOT NULL
-                AND element_at(tags, 'Project') IS NOT NULL
-                AND element_at(tags, 'Owner') IS NOT NULL
-            THEN 'Tagged'
-            ELSE 'Missing required tags'
-        END AS status,
-        current_month_projected
-    FROM resources
-)
-SELECT
-    status,
-    COUNT(*) AS resource_count,
-    SUM(current_month_projected) AS total_cost,
-    ROUND(
-        (SUM(current_month_projected) / SUM(SUM(current_month_projected)) OVER ()) * 100,
-        2
-    ) AS cost_percentage
-FROM tag_coverage
-GROUP BY status;
-```
-
-**Use case:** Executive reporting on cost allocation tag coverage.
-
-## Cost Trend Analysis
-
-> These queries compare against `last_month_cost`, which is not populated yet
-> (always 0), so they currently return no rows.
-
-### Month-over-Month Cost by Service
-
-```sql
--- Compare last month's cost with this month's projection, by service
-WITH latest AS (
-    SELECT * FROM "ti_REGION_ENV_ACCOUNT".tag_costs
-    WHERE year = YEAR(CURRENT_DATE) AND month = MONTH(CURRENT_DATE)
-      AND analysis_date = (
-          SELECT MAX(analysis_date) FROM "ti_REGION_ENV_ACCOUNT".tag_costs
-          WHERE year = YEAR(CURRENT_DATE) AND month = MONTH(CURRENT_DATE))
-),
-resources AS (
-    SELECT
-        resource_arn,
-        split_part(resource_arn, ':', 3) AS service,
-        MAX(current_month_projected) AS current_month_projected,
-        MAX(last_month_cost) AS last_month_cost
-    FROM latest
-    GROUP BY resource_arn
-)
-SELECT
-    service,
-    SUM(last_month_cost) AS last_month_cost,
-    SUM(current_month_projected) AS current_month_projected,
-    SUM(current_month_projected) - SUM(last_month_cost) AS cost_change,
-    ROUND(
-        (SUM(current_month_projected) - SUM(last_month_cost)) / NULLIF(SUM(last_month_cost), 0) * 100,
-        2
-    ) AS percent_change
-FROM resources
-GROUP BY service
-HAVING SUM(last_month_cost) > 0
-ORDER BY ABS(cost_change) DESC;
-```
-
-**Use case:** Identify services with significant cost changes month-over-month.
-
-### Environment Cost Trends
-
-```sql
--- Track environment costs across months (latest run in each month)
-WITH snapshots AS (
-    SELECT
-        *,
-        MAX(analysis_date) OVER (PARTITION BY year, month) AS month_latest
-    FROM "ti_REGION_ENV_ACCOUNT".tag_costs
-    WHERE tag_key = 'Environment'
-      AND year >= YEAR(CURRENT_DATE) - 1
-),
-monthly AS (
-    SELECT
-        tag_value AS environment,
-        year,
-        month,
-        SUM(current_month_projected) AS monthly_cost
-    FROM snapshots
-    WHERE analysis_date = month_latest
-    GROUP BY tag_value, year, month
-)
-SELECT
-    environment,
-    year,
-    month,
-    monthly_cost,
-    LAG(monthly_cost) OVER (PARTITION BY environment ORDER BY year, month) AS previous_month_cost,
-    ROUND(
-        (monthly_cost - LAG(monthly_cost) OVER (PARTITION BY environment ORDER BY year, month))
-        / NULLIF(LAG(monthly_cost) OVER (PARTITION BY environment ORDER BY year, month), 0) * 100,
-        2
-    ) AS growth_rate
-FROM monthly
-ORDER BY environment, year, month;
-```
-
-**Use case:** Track cost growth trends by environment for capacity planning.
-
-## Resource Optimization Queries
-
-### High-Cost Resource Analysis
-
-```sql
--- Resources in the top 5% of cost
-WITH latest AS (
-    SELECT * FROM "ti_REGION_ENV_ACCOUNT".tag_costs
-    WHERE year = YEAR(CURRENT_DATE) AND month = MONTH(CURRENT_DATE)
-      AND analysis_date = (
-          SELECT MAX(analysis_date) FROM "ti_REGION_ENV_ACCOUNT".tag_costs
-          WHERE year = YEAR(CURRENT_DATE) AND month = MONTH(CURRENT_DATE))
-),
-resources AS (
-    SELECT
-        resource_arn,
-        split_part(resource_arn, ':', 3) AS service,
-        resource_type,
-        account_id,
-        region,
-        MAX(current_month_projected) AS current_month_projected,
-        map_agg(tag_key, tag_value) AS tags
-    FROM latest
-    GROUP BY resource_arn, resource_type, account_id, region
-),
-cost_percentiles AS (
-    SELECT APPROX_PERCENTILE(current_month_projected, 0.95) AS p95_cost
-    FROM resources
-)
-SELECT
-    r.resource_arn,
-    r.service,
-    r.resource_type,
-    r.account_id,
-    r.region,
-    r.current_month_projected AS monthly_cost,
-    element_at(r.tags, 'Environment') AS environment,
-    element_at(r.tags, 'Project') AS project,
-    element_at(r.tags, 'Owner') AS owner
-FROM resources r
-CROSS JOIN cost_percentiles p
-WHERE r.current_month_projected >= p.p95_cost
-ORDER BY r.current_month_projected DESC;
-```
-
-**Use case:** Focus optimization efforts on highest-cost resources (Pareto principle).
-
-### Cost Anomaly Detection
-
-> Uses `last_month_cost` (not populated yet), so this returns no rows for now.
-
-```sql
--- Resources projected at 50%+ above last month
-WITH latest AS (
-    SELECT * FROM "ti_REGION_ENV_ACCOUNT".tag_costs
-    WHERE year = YEAR(CURRENT_DATE) AND month = MONTH(CURRENT_DATE)
-      AND analysis_date = (
-          SELECT MAX(analysis_date) FROM "ti_REGION_ENV_ACCOUNT".tag_costs
-          WHERE year = YEAR(CURRENT_DATE) AND month = MONTH(CURRENT_DATE))
-),
-resources AS (
-    SELECT
-        resource_arn,
-        split_part(resource_arn, ':', 3) AS service,
-        resource_type,
-        region,
-        MAX(current_month_projected) AS current_month_projected,
-        MAX(last_month_cost) AS last_month_cost,
-        map_agg(tag_key, tag_value) AS tags
-    FROM latest
-    GROUP BY resource_arn, resource_type, region
-)
-SELECT
-    resource_arn,
-    service,
-    resource_type,
-    region,
-    last_month_cost AS previous_cost,
-    current_month_projected AS current_cost,
-    current_month_projected - last_month_cost AS cost_increase,
-    ROUND((current_month_projected - last_month_cost) / NULLIF(last_month_cost, 0) * 100, 2) AS percent_increase,
-    element_at(tags, 'Environment') AS environment
-FROM resources
-WHERE last_month_cost > 0
-  AND current_month_projected > last_month_cost * 1.5
-ORDER BY percent_increase DESC
-LIMIT 100;
-```
-
-**Use case:** Detect cost anomalies that may indicate misconfigurations or runaway resources.
-
-### Right-Sizing Opportunities
-
-> Uses `last_month_cost` (not populated yet), so this returns no rows for now.
-
-```sql
--- Resources whose projected cost dropped 10%+ versus last month
-WITH latest AS (
-    SELECT * FROM "ti_REGION_ENV_ACCOUNT".tag_costs
-    WHERE year = YEAR(CURRENT_DATE) AND month = MONTH(CURRENT_DATE)
-      AND analysis_date = (
-          SELECT MAX(analysis_date) FROM "ti_REGION_ENV_ACCOUNT".tag_costs
-          WHERE year = YEAR(CURRENT_DATE) AND month = MONTH(CURRENT_DATE))
-),
-cost_trends AS (
-    SELECT
-        resource_arn,
-        split_part(resource_arn, ':', 3) AS service,
-        resource_type,
-        MAX(current_month_projected) AS current_month_projected,
-        MAX(last_month_cost) AS last_month_cost,
-        ROUND(
-            (MAX(current_month_projected) - MAX(last_month_cost)) / NULLIF(MAX(last_month_cost), 0) * 100,
-            2
-        ) AS cost_trend_percent
-    FROM latest
-    GROUP BY resource_arn, resource_type
-)
-SELECT
-    resource_arn,
-    service,
-    resource_type,
-    last_month_cost AS previous_cost,
-    current_month_projected AS current_cost,
-    cost_trend_percent,
-    CASE
-        WHEN cost_trend_percent < -30 THEN 'Significant Decrease'
-        ELSE 'Moderate Decrease'
-    END AS optimization_opportunity
-FROM cost_trends
-WHERE last_month_cost > 50
-  AND current_month_projected > 0
-  AND cost_trend_percent < -10
-ORDER BY cost_trend_percent ASC;
-```
-
-**Use case:** Identify resources with declining usage for right-sizing or termination.
-
-## BI Tool Integration
-
-### QuickSight / PowerBI / Tableau Dataset
-
-Point BI tools at one row per resource per month (latest run in each month).
-Run the `SELECT` directly, or wrap it in `CREATE OR REPLACE VIEW
-"ti_REGION_ENV_ACCOUNT".taginsights_resource_costs AS ...` to reuse it.
-
-```sql
-WITH snapshots AS (
-    SELECT
-        *,
-        MAX(analysis_date) OVER (PARTITION BY year, month) AS month_latest
-    FROM "ti_REGION_ENV_ACCOUNT".tag_costs
-    WHERE year >= YEAR(CURRENT_DATE) - 1
-)
-SELECT
-    resource_arn,
-    split_part(resource_arn, ':', 3) AS service,
-    resource_type,
-    account_id,
-    region,
-    year,
-    month,
-    DATE(CONCAT(CAST(year AS VARCHAR), '-', LPAD(CAST(month AS VARCHAR), 2, '0'), '-01')) AS month_date,
-    MAX(current_month_projected) AS current_cost,
-    MAX(last_month_cost) AS previous_cost,
-    MAX(CASE WHEN tag_key = 'Environment' THEN tag_value END) AS environment,
-    MAX(CASE WHEN tag_key = 'Project' THEN tag_value END) AS project,
-    MAX(CASE WHEN tag_key = 'Owner' THEN tag_value END) AS owner,
-    MAX(CASE WHEN tag_key = 'CostCenter' THEN tag_value END) AS cost_center,
-    MAX(CASE WHEN tag_key = 'Application' THEN tag_value END) AS application
-FROM snapshots
-WHERE analysis_date = month_latest
-GROUP BY resource_arn, resource_type, account_id, region, year, month;
-```
-
-**Use case:** One reusable dataset for dashboards; aggregate it in the BI tool.
 
 ## Query Performance Best Practices
 

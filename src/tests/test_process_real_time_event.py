@@ -108,22 +108,35 @@ class TestProcessRealTimeEventAccountValidation:
         assert result["resources_in_event"] == 1
         assert result.get("security_rejections", 0) == 0
 
-    def test_cross_account_event_still_processed(self):
+    def test_arn_from_other_account_is_dropped(self):
         """
-        Events where resource ARN account differs from envelope account
-        are still processed (strict ARN-account validation was removed).
+        A member account can only report on its own resources: ARNs naming a
+        different account than the EventBridge envelope are dropped.
         """
         event = make_eb_event(
             envelope_account="111111111111",
             resource_arn="arn:aws:ec2:us-east-1:999999999999:instance/i-foreign",
         )
-        mock_s3 = make_s3_mock()
-        with patch.object(worker, "s3", mock_s3):
-            with patch.object(worker, "sqs", MagicMock()):
-                result = worker.process_real_time_event(event)
+        with patch.object(worker, "read_state") as read_state:
+            result = worker.process_real_time_event(event)
 
-        assert result["resources_in_event"] == 1
-        assert result["account_id"] == "111111111111"
+        assert result == {"processed": 0, "changed": 0}
+        read_state.assert_not_called()
+
+    def test_forged_user_identity_does_not_choose_state_owner(self):
+        event = make_eb_event(
+            envelope_account="111122223333",
+            resource_arn="arn:aws:lambda:us-east-1:111122223333:function:f",
+        )
+        event["detail"]["userIdentity"]["accountId"] = "123456789012"
+        with (
+            patch.object(worker, "read_state", return_value={}) as read_state,
+            patch.object(worker, "write_deltas", return_value="k"),
+            patch.object(worker, "write_state"),
+            patch.object(worker, "notify_results_q"),
+        ):
+            worker.process_real_time_event(event)
+        assert read_state.call_args.args[0] == "111122223333"
 
     def test_s3_arn_no_account_component_allowed(self):
         """
@@ -132,7 +145,7 @@ class TestProcessRealTimeEventAccountValidation:
         """
         event = make_eb_event(
             envelope_account="123456789012",
-            resource_arn="arn:aws:s3:::my-bucket",
+            resource_arn="arn:aws:s3:::amzn-s3-demo-bucket",
         )
         mock_s3 = make_s3_mock()
         with patch.object(worker, "s3", mock_s3):
@@ -163,10 +176,10 @@ class TestProcessRealTimeEventAccountValidation:
         # Should use envelope_account (123456789012) and accept the resource
         assert result.get("security_rejections", 0) == 0
 
-    def test_no_envelope_account_falls_back_to_cloudtrail(self):
+    def test_no_envelope_account_is_skipped(self):
         """
-        If the EventBridge envelope 'account' field is absent (direct invocation
-        without EB wrapper), fall back to cloudtrail userIdentity.accountId.
+        Without the EventBridge envelope 'account' there is no trusted owner;
+        userIdentity.accountId is caller-controlled, so the event is skipped.
         """
         event = make_eb_event(
             envelope_account="123456789012",
@@ -179,8 +192,7 @@ class TestProcessRealTimeEventAccountValidation:
             with patch.object(worker, "sqs", MagicMock()):
                 result = worker.process_real_time_event(event)
 
-        # Should fall back to cloudtrail account and still accept matching resource
-        assert result.get("security_rejections", 0) == 0
+        assert result == {"processed": 0, "changed": 0}
 
     def test_no_account_at_all_returns_zero_processed(self):
         """
@@ -391,3 +403,177 @@ class TestProcessRealTimeEventTagMutation:
             worker.process_real_time_event(event)
 
         assert write_deltas.call_args.args[3][0]["tags"] == {"Env": "prod", "Team": "blue"}
+
+
+class TestRealTimeDeltaShape:
+
+    def _deltas(self, event, previous=None):
+        with (
+            patch.object(worker, "read_state", return_value=dict(previous or {})),
+            patch.object(worker, "write_deltas", return_value="k") as write_deltas,
+            patch.object(worker, "write_state"),
+            patch.object(worker, "notify_results_q"),
+        ):
+            worker.process_real_time_event(event)
+        return write_deltas.call_args.args[3] if write_deltas.called else []
+
+    def test_records_caller_and_api_name_with_schema_change_type(self):
+        arn = "arn:aws:lambda:us-east-1:123456789012:function:demo"
+        event = make_eb_event(resource_arn=arn, event_name="TagResource20170331v2", tags={"Team": "blue"})
+        event["detail"]["userIdentity"]["arn"] = "arn:aws:sts::123456789012:assumed-role/Admin/alice"
+        delta = self._deltas(event, {arn: {"Env": "prod"}})[0]
+        assert delta["change_type"] == "tags_changed"
+        assert delta["event_name"] == "TagResource20170331v2"
+        assert delta["changed_by"] == "arn:aws:sts::123456789012:assumed-role/Admin/alice"
+
+    def test_changed_by_falls_back_to_principal_id(self):
+        arn = "arn:aws:lambda:us-east-1:123456789012:function:demo"
+        event = make_eb_event(resource_arn=arn, tags={"Team": "blue"})
+        event["detail"]["userIdentity"]["principalId"] = "AROAEXAMPLE:alice"
+        assert self._deltas(event)[0]["changed_by"] == "AROAEXAMPLE:alice"
+
+    def test_rds_add_tags_to_resource(self):
+        arn = "arn:aws:rds:us-east-1:123456789012:db:orders"
+        event = make_eb_event(event_name="AddTagsToResource", request_parameters={
+            "resourceName": arn, "tags": [{"key": "Team", "value": "blue"}]})
+        delta = self._deltas(event, {arn: {"Env": "prod"}})[0]
+        assert delta["arn"] == arn and delta["tags"] == {"Env": "prod", "Team": "blue"}
+
+    def test_rds_remove_tags_from_resource(self):
+        arn = "arn:aws:rds:us-east-1:123456789012:db:orders"
+        event = make_eb_event(event_name="RemoveTagsFromResource", request_parameters={
+            "resourceName": arn, "tagKeys": ["Team"]})
+        assert self._deltas(event, {arn: {"Env": "prod", "Team": "blue"}})[0]["tags"] == {"Env": "prod"}
+
+    def test_elbv2_add_tags_resource_arns(self):
+        arns = [f"arn:aws:elasticloadbalancing:us-east-1:123456789012:loadbalancer/app/lb{i}/1" for i in range(2)]
+        event = make_eb_event(event_name="AddTags", request_parameters={
+            "resourceArns": arns, "tags": [{"key": "Team", "value": "blue"}]})
+        assert sorted(d["arn"] for d in self._deltas(event)) == arns
+
+    def test_fallback_ignores_caller_identity_arns(self):
+        event = make_eb_event(event_name="TagSomething", request_parameters={
+            "tags": {"Team": "blue"},
+            "role": "arn:aws:iam::123456789012:role/not-a-target"})
+        event["detail"]["userIdentity"]["arn"] = "arn:aws:sts::123456789012:assumed-role/Admin/alice"
+        event["detail"]["responseElements"] = {
+            "thing": {"arn": "arn:aws:kinesis:us-east-1:123456789012:stream/s1"}}
+        assert [d["arn"] for d in self._deltas(event)] == ["arn:aws:kinesis:us-east-1:123456789012:stream/s1"]
+
+
+class TestTagChangeCallerRecords:
+    """Caller identity goes to tag-change-events/ even when state already matches."""
+
+    ARN = "arn:aws:lambda:us-east-1:123456789012:function:demo"
+
+    def _run(self, event, previous):
+        s3 = make_s3_mock()
+        with (
+            patch.object(worker, "s3", s3),
+            patch.object(worker, "read_state", return_value=dict(previous)),
+            patch.object(worker, "write_deltas", return_value="k") as write_deltas,
+            patch.object(worker, "write_state"),
+            patch.object(worker, "notify_results_q"),
+        ):
+            result = worker.process_real_time_event(event)
+        return result, s3, write_deltas
+
+    def _event(self):
+        event = make_eb_event(resource_arn=self.ARN, event_name="TagResource20170331v2", tags={"Env": "prod"})
+        event["detail"].update({
+            "eventID": "6f1c2d3e-0000-4000-8000-abcdefabcdef",
+            "eventTime": "2026-11-12T23:13:43Z",
+            "userIdentity": {"accountId": "123456789012", "type": "AssumedRole",
+                             "arn": "arn:aws:sts::123456789012:assumed-role/Admin/alice"},
+        })
+        return event
+
+    def test_caller_recorded_when_aws_tag_already_updated_state(self):
+        # The native aws.tag event already applied Env=prod, so no delta is written...
+        result, s3, write_deltas = self._run(self._event(), {self.ARN: {"Env": "prod"}})
+        assert not write_deltas.called
+        # ...but the caller is still recorded.
+        assert result["callers_recorded"] == 1
+        put = s3.put_object.call_args.kwargs
+        assert put["Key"] == ("tag-change-events/year=2026/month=11/day=12/"
+                              "123456789012-6f1c2d3e-0000-4000-8000-abcdefabcdef.json")
+        row = __import__("json").loads(put["Body"].decode().strip())
+        assert row == {
+            "event_time": 1794525223, "event_id": "6f1c2d3e-0000-4000-8000-abcdefabcdef",
+            "event_name": "TagResource20170331v2", "account_id": "123456789012", "region": "us-east-1",
+            "arn": self.ARN, "changed_by": "arn:aws:sts::123456789012:assumed-role/Admin/alice",
+            "principal_type": "AssumedRole", "tags_set": {"Env": "prod"}, "tags_removed": [],
+        }
+
+    def test_untrusted_event_id_is_not_used_in_key(self):
+        event = self._event()
+        event["detail"]["eventID"] = "../../state/x"
+        event["id"] = "bad id/.."
+        result, s3, _ = self._run(event, {})
+        assert result["callers_recorded"] == 0
+        assert not any(c.kwargs.get("Key", "").startswith("tag-change-events/")
+                       for c in s3.put_object.call_args_list)
+
+    def test_event_without_tag_mutation_records_nothing(self):
+        event = make_eb_event(resource_arn=self.ARN, request_parameters={"resourceArn": self.ARN})
+        result, s3, _ = self._run(event, {})
+        assert result.get("callers_recorded", 0) == 0
+
+
+class TestFailedApiCalls:
+    """G1: CloudTrail also records calls that failed (errorCode set)."""
+
+    ARN = "arn:aws:lambda:us-east-1:123456789012:function:demo"
+
+    def test_failed_tag_call_changes_nothing(self):
+        event = make_eb_event(resource_arn=self.ARN, event_name="TagResource20170331v2",
+                              tags={"CostCenter": "forged"})
+        event["detail"].update({
+            "eventID": "6f1c2d3e-0000-4000-8000-abcdefabcdef",
+            "errorCode": "AccessDenied",
+            "errorMessage": "User is not authorized to perform: lambda:TagResource",
+        })
+        s3 = make_s3_mock()
+        with (
+            patch.object(worker, "s3", s3),
+            patch.object(worker, "read_state", return_value={self.ARN: {"Env": "prod"}}),
+            patch.object(worker, "write_deltas", return_value="k") as write_deltas,
+            patch.object(worker, "write_state") as write_state,
+            patch.object(worker, "notify_results_q"),
+        ):
+            result = worker.process_real_time_event(event)
+        assert not write_deltas.called
+        assert not write_state.called
+        s3.put_object.assert_not_called()  # no tag-change-events row either
+        assert result.get("deltas_written", 0) == 0
+
+
+class TestPartitionAwareArns:
+    """G5: ARNs built from IDs, bucket names and queue URLs use the Region's partition."""
+
+    ACCT = "123456789012"
+
+    def _arns(self, region, request_parameters):
+        detail = {"eventName": "CreateTags", "awsRegion": region,
+                  "requestParameters": request_parameters}
+        return [r["arn"] for r in worker.extract_resources_from_cloudtrail_event(detail, self.ACCT)]
+
+    def test_ec2_id_in_govcloud(self):
+        arns = self._arns("us-gov-west-1", {
+            "resourcesSet": {"items": [{"resourceId": "i-0abc"}]},
+            "tagSet": {"items": [{"key": "Env", "value": "prod"}]}})
+        assert arns == ["arn:aws-us-gov:ec2:us-gov-west-1:123456789012:instance/i-0abc"]
+
+    def test_s3_bucket_in_china(self):
+        arns = self._arns("cn-north-1", {"bucketName": "amzn-s3-demo-bucket", "tags": {"Env": "prod"}})
+        assert arns == ["arn:aws-cn:s3:::amzn-s3-demo-bucket"]
+
+    def test_sqs_queue_url_in_china(self):
+        arns = self._arns("cn-north-1", {
+            "queueUrl": "https://sqs.cn-north-1.amazonaws.com.cn/123456789012/orders",
+            "tags": {"Env": "prod"}})
+        assert arns == ["arn:aws-cn:sqs:cn-north-1:123456789012:orders"]
+
+    def test_commercial_unchanged(self):
+        arns = self._arns("us-east-1", {"bucketName": "amzn-s3-demo-bucket", "tags": {"Env": "prod"}})
+        assert arns == ["arn:aws:s3:::amzn-s3-demo-bucket"]

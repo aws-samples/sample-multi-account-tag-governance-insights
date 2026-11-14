@@ -62,14 +62,17 @@ Manages the full scan lifecycle across all accounts and regions. Runs daily in t
 **Algorithm:**
 
 1. Read `aggregator-state/scan-checkpoint.json` from S3; start new cycle if none exists (`scan_id` = today's date)
-2. Discover accounts: try `organizations:ListAccounts` first; fall back to extracting account IDs from RE
-   `list_indexes()` ARNs
+2. Discover accounts with `organizations:ListAccounts`. There is no fallback: if the hub is not the management account
+   or a delegated administrator, the Coordinator raises an error (a fallback would scan only the hub and report the
+   cycle complete)
 3. Build account+region pairs: call `resource-explorer-2:ListIndexes` — each local index represents an account+region
    with discoverable resources
 4. **Sequential mode** (default): invoke Worker synchronously per pair; save checkpoint every 10 completions; stop and
    checkpoint if approaching Lambda timeout (2-minute safety buffer)
 5. **Fan-out mode** (if scan age ≥ `MAX_SCAN_DAYS`): invoke all remaining Workers asynchronously in parallel (brief
-   pause every 50 invocations to avoid Lambda invoke throttling)
+   pause every 50 invocations to avoid Lambda invoke throttling), then close the cycle so the next run starts a fresh
+   one. Async invocations that fail after retries go to the `ti-worker-failures-ENV` SQS queue, which has an alarm of
+   the same name
 6. On full completion: write completion marker to `aggregator-state/completed/{scan_id}.json`, delete checkpoint
 
 **Key environment variables:**
@@ -78,6 +81,8 @@ Manages the full scan lifecycle across all accounts and regions. Runs daily in t
 - `WORKER_FUNCTION_NAME` — Worker Lambda function name to invoke
 - `HUB_REGION` — Hub region for RE index queries and Lambda invocations
 - `MAX_SCAN_DAYS` — Days before switching sequential scan to fan-out (default: 3)
+- `CHECKPOINT_SECRET_ARN` — Secrets Manager ARN of the checkpoint HMAC secret (read once per container; the value is
+  never an environment variable)
 
 ### 3.2 Worker Lambda
 
@@ -89,7 +94,8 @@ path).
 **Algorithm (scan path):**
 
 1. Call `resource-explorer-2:ListResources` directly via boto3 with filter `accountid:{account} region:{region}`
-   (not `Search`, which caps results at 1,000 per query)
+   (not `Search`, which caps results at 1,000 per query) on the org-scoped view (`OrgViewArn`, or a view whose ARN
+   contains `/org/`). Without an org view, member-account scans raise an error instead of returning empty results
 2. Extract tags inline from `Properties[name=tags].Data` — no secondary per-resource API calls
 3. Load previous state from `aggregator-state/account_id={account}/region={region}/latest.json.gz` (empty dict on first
    scan)
@@ -102,6 +108,10 @@ path).
 EventBridge rules match the native `aws.tag` "Tag Change on Resource" event (covers every tagging service, including
 tags set at creation, with the full tag set) and CloudTrail tag API events (TagResource, CreateTags, etc., which carry
 the caller identity); Worker extracts ARNs from the event payload, updates only the affected resources in state.
+CloudTrail deltas carry `changed_by` (the `userIdentity` ARN) and `event_name`; native `aws.tag` deltas carry
+`event_name` `TagChangeOnResource` and a NULL `changed_by`. Every CloudTrail tag API call also writes one row per resource to `tag_change_events` (`tag-change-events/` prefix: caller ARN, API name, tags set or removed), even when the native event already updated state, so who made a change is kept apart from the change-only delta history.
+
+**Event ordering.** EventBridge delivery is best-effort and unordered, so two changes seconds apart can arrive out of order. The delta history then briefly shows a reverted value, and a resource's `previous_tags` can be the state as read rather than the true previous set when events for one resource are processed concurrently. The daily scan reconciles state, and the cost allocator's intervals are affected only for the seconds between the out-of-order events.
 
 **Key environment variables:**
 
@@ -133,40 +143,47 @@ Hub-side Lambda that processes delta files into Athena-queryable Parquet.
 
 **File:** `src/lambda_handlers/monthly_aggregator_handler.py`
 
-Compresses 90+ days of daily delta records into monthly aggregates.
+Compacts one finished calendar month of daily delta records into `resource_tag_deltas_historical`.
 
-**Trigger:** EventBridge cron — `0 3 2 * ? *` (3 AM day 2 of each month)
+**Trigger:** EventBridge cron `0 3 2 * ? *` (3 AM day 2 of each month), or a manual event `{"year": Y, "month": M}`
 
 **Algorithm:**
 
-1. Discover accounts with data for the target month (S3 listing; Athena fallback)
-2. Query `resource_tag_deltas_recent` for previous month; group by ARN → compute `first_seen`, `last_seen`,
-   `change_count`
-3. Write aggregated Parquet to `tag-deltas/historical/account_id=X/year=Y/month=M/`
-4. Delete aggregated daily Glue partitions and S3 data
+1. Target month: the most recent calendar month that ended at least 28 days before the run (a run on November 2
+   compacts September)
+2. List the month's partitions in `resource_tag_deltas_recent` (Glue) and skip accounts that already have registered
+   historical partitions for the month
+3. Run Athena `UNLOAD` (up to 100 accounts per query, in parallel) into
+   `tag-deltas/historical/account_id=X/year=Y/month=M/`: one row per resource with `first_seen_timestamp`,
+   `last_seen_timestamp`, `change_count`, and the latest `changed_by` and `event_name`
+4. Only after every `UNLOAD` succeeds and its partitions are registered, delete the month's daily Glue partitions and
+   S3 objects. Any failure raises an error (`ti-monthly-agg-errors-ENV`)
 
-### 3.5 Cost Analysis Lambdas
+So the recent table holds roughly the last one to two months. Objects under `tag-deltas/recent/` expire after 130 days
+as a safety net. A failed month must be rerun by hand with `{"year": Y, "month": M}` before then.
 
-**Files:** `src/lambda_handlers/cost/` (deployed from `deployment/cost-analysis-stack.yaml`)  
-**Source library:** `src/lambda_handlers/cost/cur_direct_matcher.py`, `cur_provider.py`, `allocation_manager.py`
+### 3.5 Cost Allocator Lambda
 
-Matches AWS resource ARNs directly against CUR (Cost & Usage Report) line items via Athena.
+**Function:** `ti-cost-alloc-ENV-ACCOUNT` (deployed from `deployment/cost-analysis-stack.yaml`)  
+**Files:** `src/lambda_handlers/cost/cost_allocator_handler.py`, `allocation_query.py`, `query_builder.py`,
+`schema_manager.py`, `athena_query_executor.py`  
+**Trigger:** EventBridge Scheduler, daily at 06:00 UTC (`cron(0 6 * * ? *)`)
 
-**Flow:**
+**Algorithm:**
 
-1. **Coordinator** (every 12h): reads ARNs from tag delta data, dispatches batches to FIFO SQS work queue
-2. **Worker** (SQS-triggered, max 50 concurrent): normalizes ARNs to CUR `line_item_resource_id` format (
-   service-specific per `CURDirectMatcher`), queries CUR via Athena (`CURCostProvider`), writes Parquet to `tag-costs/`
-3. **Deduplicator** (SNS-triggered when queue empties): removes duplicate records using Athena CTAS
+1. Pick the months to compute: current and previous UTC month, or one `{"year", "month"}` from the event
+2. Build each resource's tag history as time intervals from `resource_tag_deltas_recent` and
+   `resource_tag_deltas_historical`
+3. Join hourly CUR `Usage`, `SavingsPlanCoveredUsage`, and `DiscountedUsage` line items to the tags on the resource
+   at that hour (full ARN, or bare resource ID with a service, account, and Region guard; Region from
+   `product_region_code` when present). `Usage` uses unblended cost; the other two use their effective cost, or
+   unblended cost when the CUR table lacks that column
+4. Write Parquet with one Athena `UNLOAD` per month to `tag-cost-allocation-staging/year=Y/month=M/<run-id>/`, then,
+   after it succeeds, replace the live `tag-cost-allocation/year=Y/month=M/` prefix with the staged files
 
-**v2 key differences:**
-
-- Work queue is **FIFO** with content-based deduplication
-- Deduplication triggered via **SNS topic** (not CloudWatch Alarm direct invocation)
-- **`EnableCostExplorerFallback=false`** by default — prevents unexpected CE API charges
-- **`CurAccountRoleArn`** parameter for cross-account CUR access via STS AssumeRole
-- `analytics_table_reader.py`, `resource_cost_analyzer.py`, `smart_cost_provider.py` removed from source;
-  `CURDirectMatcher` called directly
+Usage before TagInsights first saw a resource uses the first-observed tags and sets `tags_assumed = true`. When
+`CurCatalogAccountId` is set, the allocator reads CUR through the billing account's Glue Data Catalog, registered in
+Athena as `<ProjectName>_cur_<Environment>`.
 
 **Prerequisite:** CUR must be enabled in AWS Billing with resource IDs and Athena integration.
 
@@ -177,7 +194,8 @@ Matches AWS resource ARNs directly against CUR (Cost & Usage Report) line items 
 ### 4.1 Tag Delta Record (resource_tag_deltas_recent)
 
 `resource_tag_deltas_historical` has the same columns except it replaces `timestamp`, `scan_id`, and the `day`
-partition with `first_seen_timestamp`, `last_seen_timestamp`, and `change_count`.
+partition with `first_seen_timestamp`, `last_seen_timestamp`, and `change_count`. Its `changed_by` and `event_name` hold
+the latest non-NULL values in the month.
 
 | Field                    | Type               | Description                                            |
 |--------------------------|--------------------|--------------------------------------------------------|
@@ -187,43 +205,27 @@ partition with `first_seen_timestamp`, `last_seen_timestamp`, and `change_count`
 | `previous_tags`          | MAP<STRING,STRING> | Tags from previous scan                                |
 | `change_type`            | STRING             | `new_resource` / `tags_changed` / `resource_removed`   |
 | `timestamp`              | BIGINT             | Unix epoch seconds                                     |
-| `source_system`          | STRING             | `aggregator_worker` / `aggregator_worker_realtime`     |
+| `source_system`          | STRING             | `aggregator_worker` / `aggregator_worker_realtime` / `aggregator_worker_tag_event` |
 | `region`                 | STRING             | AWS region                                             |
 | `scan_id`                | STRING             | Scan run identifier (date string or event name)        |
+| `changed_by`             | STRING             | CloudTrail `userIdentity` ARN; NULL for native `aws.tag` events and scans |
+| `event_name`             | STRING             | API or event name (for example `TagResource`, `TagChangeOnResource`); NULL for scans |
 | `account_id`             | STRING             | AWS account ID (partition key)                         |
 | `year` / `month` / `day` | INT                | Partition keys                                         |
 
-### 4.2 Tag Cost Record (tag_costs)
+### 4.2 Tag cost allocation record (tag_cost_allocation)
 
-One row per tag on each costed resource; resource-level cost columns repeat on each tag row.
+One row per resource, day, and tag. Cost repeats on each tag key, so filter to one `tag_key` before summing.
+Partition projection on `year` and `month`; no partition maintenance.
 
-| Field                     | Type      | Description                                   |
-|---------------------------|-----------|-----------------------------------------------|
-| `tag_key` / `tag_value`   | STRING    | One tag on the resource                       |
-| `is_cost_allocation_tag`  | BOOLEAN   | Whether the key is an active cost allocation tag |
-| `resource_arn`            | STRING    | AWS resource ARN                              |
-| `resource_type`           | STRING    | Resource type                                 |
-| `region`                  | STRING    | AWS region                                    |
-| `last_month_cost`         | DOUBLE    | Previous month cost (USD); not populated yet (0) |
-| `current_month_mtd`       | DOUBLE    | Current month-to-date cost (USD)              |
-| `current_month_projected` | DOUBLE    | `avg_daily_cost` × days in month (USD)        |
-| `avg_daily_cost`          | DOUBLE    | `current_month_mtd` / day of month (USD)      |
-| `analysis_date`           | DATE      | Cost Analysis run date                        |
-| `last_updated`            | TIMESTAMP | Write time                                    |
-| `account_id`              | STRING    | Partition key                                 |
-| `year` / `month`          | INT       | Partition keys                                |
-
-------------------|---------|----------------------------------|
-| `resource_arn`   | STRING  | AWS resource ARN                 |
-| `resource_type`  | STRING  | Resource type                    |
-| `region`         | STRING  | AWS region                       |
-| `monthly_cost`   | DOUBLE  | Monthly cost (USD) from CUR      |
-| `usage_records`  | INT     | Number of CUR line items matched |
-| `avg_daily_cost` | DOUBLE  | Average daily cost               |
-| `matched_in_cur` | BOOLEAN | Whether ARN matched in CUR       |
-| `normalized_arn` | STRING  | ARN format used for CUR matching |
-| `account_id`     | STRING  | Partition key                    |
-| `year` / `month` | INT     | Partition keys                   |
+| Field                                          | Type    | Description                                                    |
+|------------------------------------------------|---------|----------------------------------------------------------------|
+| `account_id` / `resource_arn` / `resource_type` / `region` | STRING | Resource identifiers                          |
+| `usage_date`                                   | DATE    | Day the cost was incurred                                      |
+| `tag_key` / `tag_value`                        | STRING  | Tag on the resource at that time; NULL for untagged resources  |
+| `tags_assumed`                                 | BOOLEAN | Cost predates first observation; first-observed tags used      |
+| `cost`                                         | DOUBLE  | Unblended cost for `Usage`; effective cost for `SavingsPlanCoveredUsage` and `DiscountedUsage` (USD) |
+| `year` / `month`                               | INT     | Partition keys                                                 |
 
 ---
 
@@ -235,7 +237,7 @@ One row per tag on each costed resource; resource-level cost columns repeat on e
 |---------------------------------------------------|-----------------------------------------------------------------------------|
 | `deployment/core-stack.yaml`                      | Hub infrastructure (S3, Glue, Athena, SQS, EventBus, DLQs)                  |
 | `deployment/aggregator-stack.yaml`                | Coordinator + Worker + Analytics Writer + Monthly Aggregator Lambdas        |
-| `deployment/cost-analysis-stack.yaml`             | Optional: Cost Coordinator + Worker + Deduplicator + FIFO SQS + SNS trigger |
+| `deployment/cost-analysis-stack.yaml`             | Optional: Cost Allocator Lambda + daily schedule + optional cross-account CUR catalog |
 | `deployment/deploy.yaml`                          | Root deployment orchestration                                               |
 | `deployment/templates/event-forwarder-stack.yaml` | StackSet template for member account tag-change event forwarding (native `aws.tag` + CloudTrail) |
 | `deployment/tag-compliance-stack.yaml`            | Optional, deployed separately in the AWS Config delegated administrator account: tag compliance Config rule + daily SES report |
@@ -243,17 +245,27 @@ One row per tag on each costed resource; resource-level cost columns repeat on e
 
 ### 5.2 Key Parameters
 
-| Parameter                    | Default         | Description                                                     |
-|------------------------------|-----------------|-----------------------------------------------------------------|
-| `DeploymentMode`             | `SingleAccount` | `SingleAccount` / `Organization` / `SpecificAccounts`           |
-| `HubAccountId`               | —               | **Required for multi-account** — 12-digit account ID            |
-| `OrganizationId`             | —               | Required for Organization/SpecificAccounts modes                |
-| `DeploymentRegions`          | `us-east-1`     | Regions to deploy workers to                                    |
-| `EnableCostAnalysis`         | `false`         | Enables CUR cost matching                                       |
-| `CurDatabaseName`            | `""`            | Glue database name for CUR table                                |
-| `CurTableName`               | `""`            | Glue table name for CUR data                                    |
-| `CurAccountRoleArn`          | `""`            | IAM role ARN for cross-account CUR access                       |
-| `EnableCostExplorerFallback` | `false`         | Opt-in CE fallback when CUR unavailable (charges $0.01/request) |
+Root stack (`deploy.yaml`) parameters. The full reference is in
+[DEPLOYMENT.md > Parameter Reference](DEPLOYMENT.md#parameter-reference).
+
+| Parameter                 | Default          | Description                                                     |
+|---------------------------|------------------|-----------------------------------------------------------------|
+| `Environment`             | `prod`           | `dev` / `test` / `cert` / `uat` / `staging` / `prod`            |
+| `LambdaCodeBucket`        | (required)       | Code and template bucket (no dots in the name)                  |
+| `DeploymentVersion`       | (required)       | Immutable version for templates and packages                    |
+| `CheckpointSigningSecret` | (required)       | HMAC secret, at least 32 characters                             |
+| `AccessLogsBucketName`    | (required)       | Existing S3 server access-log bucket                            |
+| `OrganizationId`          | `""`             | Lets member accounts forward events to the hub event bus        |
+| `HubRegion`               | `us-east-1`      | Region of the Resource Explorer aggregator index                |
+| `OrgViewArn`              | `""`             | Org-scoped view ARN; empty auto-discovers a view with `/org/`   |
+| `PandasLayerArn`          | `""`             | AWS SDK for pandas layer; empty uses version 12 in the stack Region |
+| `EnableCodeSigning`       | `false`          | Opt-in AWS Signer enforcement; packages from `signed/v<version>/` |
+| `EnableCostAnalysis`      | `false`          | Enables the cost allocator (requires `CurBucketName`)           |
+| `CurDatabaseName`         | `""`             | Glue database name for CUR table                                |
+| `CurTableName`            | `""`             | Glue table name for CUR data                                    |
+| `CurBucketName`           | `not-configured` | S3 bucket holding CUR data                                      |
+| `CurCatalogAccountId`     | `""`             | Billing account ID for cross-account CUR                        |
+| `CurKmsKeyArn`            | `""`             | KMS key for an SSE-KMS CUR bucket                               |
 
 ---
 
@@ -269,24 +281,13 @@ src/
 │   ├── tag_compliance_rule.py       # AWS Config custom rule evaluator
 │   ├── tag_compliance_report.py     # Daily compliance report via Amazon SES
 │   └── cost/
-│       ├── allocation_manager.py    # Cost allocation tag management + CE fallback
-│       ├── cur_direct_matcher.py    # ARN → CUR line_item_resource_id normalization
-│       ├── cur_provider.py          # Athena-based CUR query execution (cross-account support)
+│       ├── allocation_query.py      # tag_cost_allocation Athena UNLOAD query
+│       ├── cost_allocator_handler.py # Daily tag_cost_allocation recompute
 │       ├── query_builder.py
 │       ├── schema_manager.py
-│       ├── athena_query_executor.py
-│       ├── parquet_writer.py
-│       ├── s3_cost_writer.py
-│       └── rate_limiter.py
+│       └── athena_query_executor.py
 ├── schemas/
 │   └── delta_schema.json            # JSON schema for delta file validation
-├── tag_manager.py                   # Tag retrieval orchestration (library use)
-├── tag_retrievers/
-│   ├── resource_explorer.py         # RE retriever
-│   ├── resource_groups.py           # ResourceGroups Tagging API fallback
-│   ├── registry.py
-│   ├── multi_region_registry.py
-│   └── base.py
 └── utils/
     ├── arn_parser.py
     ├── resource_naming.py
@@ -298,13 +299,12 @@ deployment/
 ├── cost-analysis-stack.yaml
 ├── deploy.yaml                      # Root stack: nests core, aggregator, cost-analysis
 ├── tag-compliance-stack.yaml        # Deployed separately (AWS Config delegated administrator)
-├── package_lambdas.py               # Builds + signs Lambda ZIPs (AWS Signer for prod)
+├── package_lambdas.py               # Builds Lambda ZIPs; --sign signs them with AWS Signer (opt-in)
 ├── requirements-lambda.txt
 ├── templates/
 │   ├── event-forwarder-stack.yaml   # StackSet for member account event forwarding
 │   └── tag-compliance-member-role.yaml  # StackSet: Config evaluation role in every account
 └── scripts/
-    ├── cleanup-orphaned-resources.sh
     └── collect-resource-counts.py
 ```
 

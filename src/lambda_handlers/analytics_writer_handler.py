@@ -23,7 +23,8 @@ import os
 import time
 import logging
 import hashlib
-from datetime import datetime
+import re
+from datetime import datetime, timezone
 from typing import Dict, List, Any, Optional
 from io import BytesIO
 
@@ -67,27 +68,33 @@ ENVIRONMENT = os.environ.get('ENVIRONMENT', 'prod')
 MAX_DELTA_FILE_SIZE_MB = int(os.environ.get('MAX_DELTA_FILE_SIZE_MB', '10'))
 MAX_DELTA_FILE_SIZE_BYTES = MAX_DELTA_FILE_SIZE_MB * 1024 * 1024
 QUARANTINE_PREFIX = 'quarantine/'
+DELTA_PREFIX = 'deltas/'  # aggregator_worker.delta_key()
 
-# Load JSON schema for delta validation
+# Load JSON schema for delta validation. Candidate locations, in order:
+#   <handler dir>/schemas/      (schema shipped next to the handler)
+#   <handler dir>/src/schemas/  (Lambda ZIP: package_lambdas.py copies src/)
+#   <repo>/src/schemas/         (running from the source tree)
+_HANDLER_DIR = os.path.dirname(os.path.abspath(__file__))
+_SCHEMA_CANDIDATES = (
+    os.path.join(_HANDLER_DIR, 'schemas', 'delta_schema.json'),
+    os.path.join(_HANDLER_DIR, 'src', 'schemas', 'delta_schema.json'),
+    os.path.join(_HANDLER_DIR, os.pardir, 'schemas', 'delta_schema.json'),
+)
 _DELTA_SCHEMA = None
 
+
 def _load_delta_schema():
-    """Load delta JSON schema for validation. Cached after first load."""
+    """Load the delta JSON schema (cached). Raises if it cannot be found:
+    with jsonschema installed, a missing schema must not silently turn
+    validation off."""
     global _DELTA_SCHEMA
-    if _DELTA_SCHEMA is not None:
-        return _DELTA_SCHEMA
-    try:
-        import os as _os
-        schema_path = _os.path.join(_os.path.dirname(__file__), '../../schemas/delta_schema.json')
-        schema_path = _os.path.abspath(schema_path)
-        if _os.path.exists(schema_path):
-            with open(schema_path) as f:
-                _DELTA_SCHEMA = json.load(f)
-            logger.info("Delta schema loaded for validation")
-        else:
-            logger.warning(f"Delta schema not found at {schema_path}, validation disabled")
-    except Exception as e:
-        logger.warning(f"Could not load delta schema: {e}, validation disabled")
+    if _DELTA_SCHEMA is None:
+        path = next((c for c in _SCHEMA_CANDIDATES if os.path.isfile(c)), None)
+        if path is None:
+            raise FileNotFoundError(f"delta_schema.json not found in {_SCHEMA_CANDIDATES}")
+        with open(path) as f:
+            _DELTA_SCHEMA = json.load(f)
+        logger.info(f"Delta schema loaded from {path}")
     return _DELTA_SCHEMA
 
 
@@ -124,20 +131,15 @@ def _validate_delta_file(data: bytes, source_key: str) -> Optional[List[Dict]]:
 
     # 4. Schema validation (if jsonschema available)
     if HAS_JSONSCHEMA:
-        schema = _load_delta_schema()
-        if schema:
-            try:
-                jsonschema.validate(instance=deltas, schema=schema)
-            except jsonschema.ValidationError as e:
-                logger.error(
-                    f"DELTA REJECTED: Delta file schema validation failed: "
-                    f"{e.message} at {list(e.path)}. Key: {source_key}"
-                )
-                emit_metric('SchemaValidationFailedDeltaFile', 1)
-                return None
-            except jsonschema.SchemaError as e:
-                # Schema itself is broken — log but continue (defensive)
-                logger.warning(f"Schema definition error (skipping validation): {e}")
+        try:
+            jsonschema.validate(instance=deltas, schema=_load_delta_schema())
+        except jsonschema.ValidationError as e:
+            logger.error(
+                f"DELTA REJECTED: Delta file schema validation failed: "
+                f"{e.message} at {list(e.path)}. Key: {source_key}"
+            )
+            emit_metric('SchemaValidationFailedDeltaFile', 1)
+            return None
 
     return deltas
 
@@ -148,12 +150,13 @@ def _quarantine_malicious_file(bucket: str, key: str):
     Non-fatal: logs warning if quarantine fails.
     """
     try:
-        quarantine_key = f"{QUARANTINE_PREFIX}{datetime.utcnow().strftime('%Y/%m/%d/')}{key.replace('/', '_')}"
+        now = datetime.now(timezone.utc)
+        quarantine_key = f"{QUARANTINE_PREFIX}{now.strftime('%Y/%m/%d/')}{key.replace('/', '_')}"
         s3_client.copy_object(
             Bucket=bucket,
             CopySource={'Bucket': bucket, 'Key': key},
             Key=quarantine_key,
-            Metadata={'original_key': key, 'quarantined_at': datetime.utcnow().isoformat()},
+            Metadata={'original_key': key, 'quarantined_at': now.replace(tzinfo=None).isoformat()},
             MetadataDirective='REPLACE'
         )
         s3_client.delete_object(Bucket=bucket, Key=key)
@@ -177,14 +180,19 @@ def lambda_handler(event, context):
     Process SQS messages with delta S3 locations
     Handles S3 replication delays with progressive retry logic
     Implements deduplication to prevent duplicate writes
+
+    The ESM uses ReportBatchItemFailures: a failing record is returned in
+    batchItemFailures (retried, then sent to the DLQ) without failing the
+    rest of the batch.
     
     Args:
         event: SQS event with Records containing delta notifications
         context: Lambda context
         
     Returns:
-        Dict: Processing results
+        Dict: Processing results, including batchItemFailures
     """
+    batch_item_failures = []
     try:
         logger.info(f"Analytics Writer started: {len(event.get('Records', []))} messages")
         
@@ -255,8 +263,8 @@ def lambda_handler(event, context):
             except Exception as e:
                 failed += 1
                 logger.error(f"Error processing SQS message: {str(e)}", exc_info=True)
-                # Re-raise to trigger SQS retry (which will go to DLQ after maxReceiveCount)
-                raise
+                # Retried by SQS, then routed to the DLQ after maxReceiveCount
+                batch_item_failures.append({'itemIdentifier': record['messageId']})
         
         result = {
             'statusCode': 200,
@@ -264,7 +272,8 @@ def lambda_handler(event, context):
             'failed_messages': failed,
             'retried_messages': retried,
             'duplicate_writes_prevented': duplicates,
-            'total_deltas_written': total_deltas
+            'total_deltas_written': total_deltas,
+            'batchItemFailures': batch_item_failures,
         }
         
         logger.info(f"Analytics Writer completed: {result}")
@@ -281,194 +290,15 @@ def lambda_handler(event, context):
         raise
 
 
-def read_deltas_from_regional_s3(bucket: str, key: str, region: str) -> List[Dict]:
-    """
-    Read delta JSON from CENTRAL analytics bucket (replicated from regional)
-    
-    S3 Replication Architecture:
-    - Regional worker writes to: s3://ti-state-{region}-{env}-{account}/deltas/...
-    - S3 replicates to: s3://ti-central-analytics-{hub-region}-{env}-{hub-account}/deltas/...
-    - Analytics writer reads from central bucket (same account, same region = no DTO costs)
-    
-    Args:
-        bucket: IGNORED - kept for backward compatibility with SQS message format
-        key: S3 key to delta JSON file (same path structure after replication)
-        region: Source region for logging
-        
-    Returns:
-        List[Dict]: List of delta records
-    """
-    try:
-        # CHANGE: Read from CENTRAL bucket instead of regional spoke bucket
-        # The key path is preserved during replication: deltas/timestamp-changes.json
-        central_key = key  # Same key structure after replication
-        
-        logger.debug(f"Reading replicated deltas from s3://{CENTRAL_ANALYTICS_BUCKET}/{central_key}")
-        logger.debug(f"Original regional location was: s3://{bucket}/{key} (region: {region})")
-        
-        # Read from central analytics bucket (local, no cross-account/cross-region access)
-        response = s3_client.get_object(
-            Bucket=CENTRAL_ANALYTICS_BUCKET,  # Read from central, not regional
-            Key=central_key
-        )
-        
-        # Read and parse JSON
-        data = response['Body'].read().decode('utf-8')
-        deltas = json.loads(data)
-        
-        logger.info(f"Read {len(deltas)} deltas from central S3 (replicated from {region})")
-        return deltas
-        
-    except ClientError as e:
-        error_code = e.response['Error']['Code']
-        if error_code == 'NoSuchKey':
-            logger.warning(f"Delta file not found in central bucket: {CENTRAL_ANALYTICS_BUCKET}/{central_key}")
-            logger.warning(f"This may indicate S3 replication has not completed yet from {region}")
-            logger.warning(f"Original location: s3://{bucket}/{key}")
-            return []
-        elif error_code == 'AccessDenied':
-            logger.error(f"Access denied to central analytics bucket: {CENTRAL_ANALYTICS_BUCKET}")
-            logger.error(f"This should not happen - Lambda should have permissions to central bucket")
-            raise
-        else:
-            logger.error(f"S3 error reading deltas from central bucket: {error_code}")
-            raise
-    except Exception as e:
-        logger.error(f"Error reading deltas from central S3: {str(e)}")
-        raise
-
-
-def write_deltas_to_central_s3(deltas: List[Dict], message: Dict):
-    """
-    Write deltas to central S3 in Parquet format with proper partitioning
-    
-    Args:
-        deltas: List of delta records
-        message: Original SQS message with metadata
-    """
-    try:
-        # Extract partition keys
-        account_id = message.get('account_id')
-        if not account_id:
-            # Fallback: extract from first delta ARN
-            account_id = extract_account_from_arn(deltas[0]['arn'])
-        
-        timestamp = datetime.fromtimestamp(message['timestamp'])
-        
-        # Build partition path: account_id/year/month/day
-        partition_path = (
-            f"account_id={account_id}/"
-            f"year={timestamp.year}/"
-            f"month={timestamp.month}/"
-            f"day={timestamp.day}/"
-        )
-        
-        # Write as Parquet (preferred) or JSON (fallback)
-        if HAS_PARQUET:
-            write_parquet(deltas, partition_path, timestamp)
-        else:
-            write_json(deltas, partition_path, timestamp)
-        
-        # Register partition with Glue (for immediate query availability)
-        register_partition(account_id, timestamp.year, timestamp.month, timestamp.day)
-        
-        logger.info(f"Wrote {len(deltas)} deltas to partition: {partition_path}")
-        
-    except Exception as e:
-        logger.error(f"Error writing deltas to central S3: {str(e)}")
-        raise
-
-
-def write_parquet(deltas: List[Dict], partition_path: str, timestamp: datetime):
-    """Write deltas as Parquet file"""
-    try:
-        # Define explicit PyArrow schema that matches Athena table definition
-        # This prevents schema inference issues with empty maps
-        schema = pa.schema([
-            ('arn', pa.string()),
-            ('resource_type', pa.string()),
-            ('tags', pa.map_(pa.string(), pa.string())),  # MAP<STRING,STRING>
-            ('previous_tags', pa.map_(pa.string(), pa.string())),  # MAP<STRING,STRING>
-            ('change_type', pa.string()),
-            ('timestamp', pa.int64()),
-            ('source_system', pa.string()),
-            ('region', pa.string()),
-            ('scan_id', pa.string())
-        ])
-        
-        # Prepare data with proper defaults for missing columns
-        prepared_deltas = []
-        for delta in deltas:
-            prepared = {
-                'arn': delta.get('arn'),
-                'resource_type': delta.get('resource_type'),
-                'tags': delta.get('tags', {}),  # Keep empty dict, don't convert to None
-                'previous_tags': delta.get('previous_tags', {}),  # Keep empty dict
-                'change_type': delta.get('change_type'),
-                'timestamp': delta.get('timestamp'),
-                'source_system': delta.get('source_system'),
-                'region': delta.get('region'),
-                'scan_id': delta.get('scan_id')
-            }
-            prepared_deltas.append(prepared)
-        
-        # Convert to DataFrame
-        df = pd.DataFrame(prepared_deltas)
-        
-        # Convert to PyArrow table with explicit schema
-        # This ensures MAP types are preserved correctly
-        table = pa.Table.from_pandas(df, schema=schema)
-        parquet_buffer = BytesIO()
-        pq.write_table(table, parquet_buffer, compression='snappy')
-        parquet_buffer.seek(0)
-        
-        # Write to S3
-        s3_key = (
-            f"tag-deltas/recent/{partition_path}"
-            f"deltas-{timestamp.strftime('%H-%M-%S')}.parquet"
-        )
-        
-        s3_client.put_object(
-            Bucket=CENTRAL_ANALYTICS_BUCKET,
-            Key=s3_key,
-            Body=parquet_buffer.getvalue(),
-            ContentType='application/octet-stream'
-        )
-        
-        logger.debug(f"Wrote Parquet: s3://{CENTRAL_ANALYTICS_BUCKET}/{s3_key}")
-        
-    except Exception as e:
-        logger.error(f"Error writing Parquet: {str(e)}")
-        raise
-
-
-def write_json(deltas: List[Dict], partition_path: str, timestamp: datetime):
-    """Write deltas as JSON (fallback when Parquet not available)"""
-    try:
-        # Write to S3 as JSON
-        s3_key = (
-            f"tag-deltas/recent/{partition_path}"
-            f"deltas-{timestamp.strftime('%H-%M-%S')}.json"
-        )
-        
-        s3_client.put_object(
-            Bucket=CENTRAL_ANALYTICS_BUCKET,
-            Key=s3_key,
-            Body=json.dumps(deltas),
-            ContentType='application/json'
-        )
-        
-        logger.debug(f"Wrote JSON: s3://{CENTRAL_ANALYTICS_BUCKET}/{s3_key}")
-        
-    except Exception as e:
-        logger.error(f"Error writing JSON: {str(e)}")
-        raise
-
-
 def register_partition(account_id: str, year: int, month: int, day: int):
     """
-    Register partition with Glue for immediate Athena query availability
-    
+    Register partition with Glue for immediate Athena query availability.
+
+    Errors other than AlreadyExists propagate: the table has no partition
+    projection and nothing runs MSCK REPAIR, so an unregistered partition is
+    invisible to Athena and to the monthly compaction. The record fails and
+    SQS retries it.
+
     Args:
         account_id: AWS account ID
         year: Year partition value
@@ -514,9 +344,6 @@ def register_partition(account_id: str, year: int, month: int, day: int):
         
     except glue_client.exceptions.AlreadyExistsException:
         logger.debug(f"Partition already exists (race condition): {account_id}/{year}/{month}/{day}")
-    except Exception as e:
-        # Non-fatal - partition will be discovered on next MSCK REPAIR TABLE
-        logger.warning(f"Could not register partition: {str(e)}")
 
 
 def extract_account_from_arn(arn: str) -> str:
@@ -551,6 +378,11 @@ def read_deltas_from_regional_s3_with_retry(bucket: str, key: str, region: str) 
             - deltas: List of delta records (empty if not found)
             - replication_pending: True if file not found (likely replication delay)
     """
+    # Trust boundary: the key comes from an SQS message. Only worker delta files
+    # (deltas/...) may be read, and so quarantined (deleted) on bad content.
+    if not isinstance(key, str) or not key.startswith(DELTA_PREFIX):
+        raise ValueError(f"Refusing delta key outside {DELTA_PREFIX}: {key!r}")
+
     try:
         central_key = key
         
@@ -560,6 +392,18 @@ def read_deltas_from_regional_s3_with_retry(bucket: str, key: str, region: str) 
             Bucket=CENTRAL_ANALYTICS_BUCKET,
             Key=central_key
         )
+
+        # Check the size before reading: read() loads the whole object into memory.
+        size = response.get('ContentLength')
+        if isinstance(size, int) and size > MAX_DELTA_FILE_SIZE_BYTES:
+            response['Body'].close()
+            logger.error(
+                f"DELTA REJECTED: Delta file too large: {size:,} bytes "
+                f"(max {MAX_DELTA_FILE_SIZE_BYTES:,}). Key: {central_key}"
+            )
+            emit_metric('OversizedDeltaFileRejected', 1)
+            _quarantine_malicious_file(CENTRAL_ANALYTICS_BUCKET, central_key)
+            return [], False
 
         raw_data = response['Body'].read()
 
@@ -709,21 +553,23 @@ def generate_content_hash(deltas: List[Dict]) -> str:
         str: 16-character hex hash (SHA-256 truncated)
     """
     try:
-        # Sort by ARN for deterministic ordering
-        sorted_deltas = sorted(deltas, key=lambda x: x.get('arn', ''))
-        
-        # Create canonical representation (exclude processing metadata)
+        # Create canonical representation (exclude processing metadata).
+        # timestamp and changed_by are part of the change: a later repeat of the
+        # same tag change, or the same change by another caller, is a new record.
         canonical_deltas = []
-        for d in sorted_deltas:
+        for d in deltas:
             canonical_deltas.append({
                 'arn': d.get('arn'),
                 'resource_type': d.get('resource_type'),
                 'tags': d.get('tags', {}),
                 'previous_tags': d.get('previous_tags', {}),
-                'change_type': d.get('change_type')
+                'change_type': d.get('change_type'),
+                'timestamp': d.get('timestamp'),
+                'changed_by': d.get('changed_by'),
             })
         
-        # Generate hash
+        # Sort the canonical records for a deterministic, order-independent hash
+        canonical_deltas.sort(key=lambda c: json.dumps(c, sort_keys=True, default=str))
         canonical_json = json.dumps(canonical_deltas, sort_keys=True)
         content_hash = hashlib.sha256(canonical_json.encode()).hexdigest()[:16]
         
@@ -752,6 +598,10 @@ def write_deltas_to_central_s3_with_dedup(deltas: List[Dict], message: Dict) -> 
         account_id = message.get('account_id')
         if not account_id:
             account_id = extract_account_from_arn(deltas[0]['arn'])
+        # The monthly aggregator only compacts (and cleans) 12-digit account
+        # partitions; anything else would be written where nothing reads it.
+        if not isinstance(account_id, str) or not re.fullmatch(r'\d{12}', account_id):
+            raise ValueError(f"Invalid partition account_id: {account_id!r}")
         
         timestamp = datetime.fromtimestamp(message['timestamp'])
         
@@ -778,28 +628,32 @@ def write_deltas_to_central_s3_with_dedup(deltas: List[Dict], message: Dict) -> 
                 Bucket=CENTRAL_ANALYTICS_BUCKET,
                 Key=s3_key
             )
-            
+        except ClientError as e:
+            # HEAD has no body, so a missing key surfaces as '404', not NoSuchKey
+            if e.response['Error']['Code'] in ('404', 'NoSuchKey', 'NotFound'):
+                # File doesn't exist - proceed with write
+                logger.info(f"✓ New write: {s3_key} (hash: {content_hash})")
+            else:
+                # Other S3 error - log but proceed
+                logger.warning(f"S3 HEAD error: {e}, proceeding with write")
+        else:
             file_size = head_response.get('ContentLength', 0)
+            # A retry after a failed registration lands here: make sure the
+            # partition exists (cheap get_partition when it already does).
+            # Outside the HEAD try so a Glue ClientError is not read as a HEAD error.
+            register_partition(account_id, timestamp.year, timestamp.month, timestamp.day)
             logger.info(f"✓ Duplicate detected and prevented: {s3_key}")
             logger.info(f"  Content hash: {content_hash}, {len(deltas)} deltas, {file_size:,} bytes")
-            
+
             emit_metric('DuplicateWritesPrevented', 1)
             emit_metric('DuplicateDetectionLatency', 50, unit='Milliseconds')  # Approximate HEAD latency
-            
+
             return {
                 'duplicate': True,
                 'key': s3_key,
                 'content_hash': content_hash,
                 'deltas_count': len(deltas)
             }
-            
-        except ClientError as e:
-            if e.response['Error']['Code'] == 'NoSuchKey':
-                # File doesn't exist - proceed with write
-                logger.info(f"✓ New write: {s3_key} (hash: {content_hash})")
-            else:
-                # Other S3 error - log but proceed
-                logger.warning(f"S3 HEAD error: {e}, proceeding with write")
         
         # Write Parquet file
         if HAS_PARQUET:
@@ -826,10 +680,28 @@ def write_deltas_to_central_s3_with_dedup(deltas: List[Dict], message: Dict) -> 
         raise
 
 
+def prepare_delta_row(delta: Dict) -> Dict:
+    """One Parquet row; scan deltas have no changed_by/event_name (null)."""
+    return {
+        'arn': delta.get('arn'),
+        'resource_type': delta.get('resource_type'),
+        'tags': delta.get('tags', {}),  # keep empty dict, don't convert to None
+        'previous_tags': delta.get('previous_tags', {}),
+        'change_type': delta.get('change_type'),
+        'timestamp': delta.get('timestamp'),
+        'source_system': delta.get('source_system'),
+        'region': delta.get('region'),
+        'scan_id': delta.get('scan_id'),
+        'changed_by': delta.get('changed_by'),
+        'event_name': delta.get('event_name'),
+    }
+
+
 def write_parquet_with_hash(deltas: List[Dict], partition_path: str, content_hash: str):
     """Write deltas as Parquet file with content-based filename"""
     try:
-        # Delta schema (matches the resource_tag_deltas_recent Glue table)
+        # Delta schema (matches the resource_tag_deltas_recent Glue table).
+        # New columns go at the end so older Parquet files still read.
         schema = pa.schema([
             ('arn', pa.string()),
             ('resource_type', pa.string()),
@@ -840,23 +712,11 @@ def write_parquet_with_hash(deltas: List[Dict], partition_path: str, content_has
             ('source_system', pa.string()),
             ('region', pa.string()),
             ('scan_id', pa.string()),
+            ('changed_by', pa.string()),
+            ('event_name', pa.string()),
         ])
-        
-        prepared_deltas = []
-        for delta in deltas:
-            prepared = {
-                'arn': delta.get('arn'),
-                'resource_type': delta.get('resource_type'),
-                'tags': delta.get('tags', {}),
-                'previous_tags': delta.get('previous_tags', {}),
-                'change_type': delta.get('change_type'),
-                'timestamp': delta.get('timestamp'),
-                'source_system': delta.get('source_system'),
-                'region': delta.get('region'),
-                'scan_id': delta.get('scan_id'),
-            }
-            prepared_deltas.append(prepared)
-        
+        prepared_deltas = [prepare_delta_row(delta) for delta in deltas]
+
         df = pd.DataFrame(prepared_deltas)
         table = pa.Table.from_pandas(df, schema=schema)
         parquet_buffer = BytesIO()
@@ -915,7 +775,7 @@ def emit_metric(metric_name: str, value: float, unit: str = 'Count'):
                 'MetricName': metric_name,
                 'Value': value,
                 'Unit': unit,
-                'Timestamp': datetime.utcnow()
+                'Timestamp': datetime.now(timezone.utc)
             }]
         )
     except Exception as e:

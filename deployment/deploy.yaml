@@ -25,7 +25,7 @@ Parameters:
 
   LambdaCodeBucket:
     Type: String
-    Description: S3 bucket name containing pre-built Lambda deployment packages (e.g., my-taginsights-bucket)
+    Description: S3 bucket name containing pre-built Lambda deployment packages (e.g., amzn-s3-demo-taginsights-code)
 
   AccessLogsBucketName:
     Type: String
@@ -46,18 +46,8 @@ Parameters:
   HubRegion:
     Type: String
     Default: us-east-1
-    AllowedValues:
-      - us-east-1
-      - us-east-2
-      - us-west-1
-      - us-west-2
-      - eu-west-1
-      - eu-west-2
-      - eu-central-1
-      - ap-southeast-1
-      - ap-southeast-2
-      - ap-northeast-1
-      - ca-central-1
+    AllowedPattern: "^[a-z]{2}(-[a-z]+)+-[0-9]+$"
+    ConstraintDescription: Must be an AWS Region code (for example us-east-1).
     Description: Hub region where the Resource Explorer aggregator index is configured
 
   ScanSchedule:
@@ -134,28 +124,13 @@ Parameters:
       S3 bucket name where CUR data is stored. Required when EnableCostAnalysis=true.
       IAM access is scoped to this specific bucket.
 
-  CurAccountRoleArn:
+  CurCatalogAccountId:
     Type: String
     Default: ""
-    AllowedPattern: "^(arn:aws:iam::[0-9]{12}:role/.+)?$"
+    AllowedPattern: "^([0-9]{12})?$"
     Description: >
-      IAM role ARN for cross-account CUR access. Leave empty when CUR is in
-      the same account as the hub.
-
-  CurExternalId:
-    Type: String
-    Default: ""
-    NoEcho: true
-    Description: >
-      External ID for cross-account CUR role assumption. Required when
-      CurAccountRoleArn is configured.
-
-  CurAthenaResultsBucket:
-    Type: String
-    Default: ""
-    Description: >
-      Optional Athena results bucket in the CUR account. Leave empty to use
-      the existing TagInsights Athena results bucket.
+      Billing account that owns the CUR Glue table, when it is not the hub
+      account. See docs/cost-analysis/README.md (Cross-Account CUR Setup).
 
   DeploymentVersion:
     Type: String
@@ -167,12 +142,53 @@ Parameters:
   CheckpointSigningSecret:
     Type: String
     NoEcho: true
+    MinLength: 32
     Description: >
-      HMAC secret for checkpoint integrity. Required.
+      HMAC secret for checkpoint integrity. Required, at least 32 characters.
       Generate with 'openssl rand -hex 32'.
+
+  EnableCodeSigning:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Enforce AWS Signer code signing and load packages from signed/v<version>/
+      (aggregator functions that use the pandas layer are exempt; see
+      aggregator-stack.yaml). Requires the taginsights-lambda-signer profile and
+      package_lambdas.py --sign. Independent of Environment.
+
+  PandasLayerArn:
+    Type: String
+    Default: ""
+    Description: >
+      Optional AWSSDKPandas (Python 3.14) layer version ARN for the analytics Lambdas.
+      Empty uses the AWS-published AWSSDKPandas-Python314 layer (see aggregator-stack.yaml).
+
+  OrgViewArn:
+    Type: String
+    Default: ""
+    Description: >
+      ARN of the org-scoped AWS Resource Explorer view. Empty auto-discovers a view
+      with /org/ in its ARN.
+
+  CurKmsKeyArn:
+    Type: String
+    Default: ""
+    AllowedPattern: "^(arn:[a-z-]+:kms:[a-z0-9-]+:[0-9]{12}:key/[A-Za-z0-9-]+)?$"
+    Description: >
+      KMS key ARN encrypting the CUR bucket (SSE-KMS). Empty for SSE-S3.
+      Passed to cost-analysis-stack.yaml.
+
+Rules:
+  CostAnalysisRequiresCurBucket:
+    RuleCondition: !Equals [!Ref EnableCostAnalysis, "true"]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref CurBucketName, "not-configured"]]
+        AssertDescription: CurBucketName is required when EnableCostAnalysis is true.
 
 Conditions:
   EnableCostAnalysisCondition: !Equals [!Ref EnableCostAnalysis, "true"]
+  EnableRealTimeEventsCondition: !Equals [!Ref EnableRealTimeEvents, "true"]
 
 Resources:
   # ============================================================================
@@ -183,7 +199,7 @@ Resources:
   CoreStack:
     Type: AWS::CloudFormation::Stack
     Properties:
-      TemplateURL: !Sub "https://s3.amazonaws.com/${LambdaCodeBucket}/templates/v${DeploymentVersion}/core-stack.yaml"
+      TemplateURL: !Sub "https://${LambdaCodeBucket}.s3.${AWS::Region}.${AWS::URLSuffix}/templates/v${DeploymentVersion}/core-stack.yaml"
       Parameters:
         ProjectName: ti
         Environment: !Ref Environment
@@ -206,7 +222,7 @@ Resources:
     Type: AWS::CloudFormation::Stack
     DependsOn: CoreStack
     Properties:
-      TemplateURL: !Sub "https://s3.amazonaws.com/${LambdaCodeBucket}/templates/v${DeploymentVersion}/aggregator-stack.yaml"
+      TemplateURL: !Sub "https://${LambdaCodeBucket}.s3.${AWS::Region}.${AWS::URLSuffix}/templates/v${DeploymentVersion}/aggregator-stack.yaml"
       Parameters:
         ProjectName: ti
         Environment: !Ref Environment
@@ -220,6 +236,9 @@ Resources:
         LogLevel: !Ref LogLevel
         CheckpointSigningSecret: !Ref CheckpointSigningSecret
         ForceDeleteOnStackRemoval: !Ref ForceDeleteOnStackRemoval
+        EnableCodeSigning: !Ref EnableCodeSigning
+        PandasLayerArn: !Ref PandasLayerArn
+        OrgViewArn: !Ref OrgViewArn
       Tags:
         - Key: Application
           Value: TagInsights
@@ -239,7 +258,7 @@ Resources:
     Condition: EnableCostAnalysisCondition
     DependsOn: CoreStack
     Properties:
-      TemplateURL: !Sub "https://s3.amazonaws.com/${LambdaCodeBucket}/templates/v${DeploymentVersion}/cost-analysis-stack.yaml"
+      TemplateURL: !Sub "https://${LambdaCodeBucket}.s3.${AWS::Region}.${AWS::URLSuffix}/templates/v${DeploymentVersion}/cost-analysis-stack.yaml"
       Parameters:
         ProjectName: ti
         Environment: !Ref Environment
@@ -247,10 +266,11 @@ Resources:
         CurDatabaseName: !Ref CurDatabaseName
         CurTableName: !Ref CurTableName
         CurBucketName: !Ref CurBucketName
-        CurAccountRoleArn: !Ref CurAccountRoleArn
-        CurExternalId: !Ref CurExternalId
-        CurAthenaResultsBucket: !Ref CurAthenaResultsBucket
+        CurCatalogAccountId: !Ref CurCatalogAccountId
+        CurKmsKeyArn: !Ref CurKmsKeyArn
         DeploymentVersion: !Ref DeploymentVersion
+        EnableCodeSigning: !Ref EnableCodeSigning
+        LogLevel: !Ref LogLevel
       Tags:
         - Key: Application
           Value: TagInsights
@@ -271,9 +291,9 @@ Outputs:
   NextStep:
     Description: Required next step for multi-account real-time detection
     Value: !If
-      - EnableCostAnalysisCondition
+      - EnableRealTimeEventsCondition
       - "Deploy event-forwarder-stack.yaml as a StackSet to member accounts. See docs/DEPLOYMENT.md."
-      - "If EnableRealTimeEvents=true, deploy event-forwarder-stack.yaml as a StackSet to member accounts. See docs/DEPLOYMENT.md."
+      - "None. Real-time events are disabled; tags are collected by the scheduled scan only."
 
   CentralAnalyticsBucket:
     Description: Central analytics S3 bucket

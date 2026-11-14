@@ -45,6 +45,9 @@ Resources:
             Principal:
               Service: events.amazonaws.com
             Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
       Policies:
         - PolicyName: EventForwarderPolicy
           PolicyDocument:
@@ -53,7 +56,7 @@ Resources:
               - Effect: Allow
                 Action:
                   - events:PutEvents
-                Resource: !Sub "arn:aws:events:${HubRegion}:${HubAccountId}:event-bus/${ProjectName}-hub-${Environment}"
+                Resource: !Sub "arn:${AWS::Partition}:events:${HubRegion}:${HubAccountId}:event-bus/${ProjectName}-hub-${Environment}"
 
   # ============================================================================
   # CORE EVENTBRIDGE FORWARDING RULE
@@ -75,6 +78,9 @@ Resources:
           - aws.dynamodb
           - aws.ecs
           - aws.eks
+          - aws.elasticloadbalancing
+          # KMS keys are tagged with TagResource/UntagResource and keyId
+          - aws.kms
         detail-type:
           - AWS API Call via CloudTrail
         detail:
@@ -87,8 +93,17 @@ Resources:
             - prefix: UntagResource
             - prefix: PutBucketTagging
             - prefix: DeleteBucketTagging
+            # RDS, DocumentDB and Neptune (all source aws.rds)
+            - prefix: AddTagsToResource
+            - prefix: RemoveTagsFromResource
+            # ELB / ELBv2
+            - prefix: AddTags
+            - prefix: RemoveTags
+          # Failed calls (AccessDenied, DryRun, ...) changed no tags
+          errorCode:
+            - exists: false
       Targets:
-        - Arn: !Sub "arn:aws:events:${HubRegion}:${HubAccountId}:event-bus/${ProjectName}-hub-${Environment}"
+        - Arn: !Sub "arn:${AWS::Partition}:events:${HubRegion}:${HubAccountId}:event-bus/${ProjectName}-hub-${Environment}"
           Id: HubEventBusTarget
           RoleArn: !GetAtt EventForwarderRole.Arn
 
@@ -112,7 +127,7 @@ Resources:
         detail-type:
           - Tag Change on Resource
       Targets:
-        - Arn: !Sub "arn:aws:events:${HubRegion}:${HubAccountId}:event-bus/${ProjectName}-hub-${Environment}"
+        - Arn: !Sub "arn:${AWS::Partition}:events:${HubRegion}:${HubAccountId}:event-bus/${ProjectName}-hub-${Environment}"
           Id: HubEventBusTagChangeTarget
           RoleArn: !GetAtt EventForwarderRole.Arn
 
@@ -129,9 +144,10 @@ Resources:
       State: ENABLED
       EventPattern:
         source:
+          # DocumentDB and Neptune events are source aws.rds and Transit
+          # Gateway events are aws.ec2 (both in the core rule), so no
+          # aws.docdb / aws.neptune-db / aws.transitgateway sources here.
           - aws.elasticache
-          - aws.docdb
-          - aws.neptune-db
           - aws.redshift
           - aws.athena
           - aws.quicksight
@@ -144,7 +160,6 @@ Resources:
           - aws.cloudfront
           - aws.apigateway
           - aws.directconnect
-          - aws.transitgateway
           - aws.vpc-lattice
           - aws.network-firewall
           - aws.route53resolver
@@ -182,8 +197,11 @@ Resources:
             - prefix: RemoveTags
             - prefix: TagQueue
             - prefix: UntagQueue
+          # Failed calls (AccessDenied, DryRun, ...) changed no tags
+          errorCode:
+            - exists: false
       Targets:
-        - Arn: !Sub "arn:aws:events:${HubRegion}:${HubAccountId}:event-bus/${ProjectName}-hub-${Environment}"
+        - Arn: !Sub "arn:${AWS::Partition}:events:${HubRegion}:${HubAccountId}:event-bus/${ProjectName}-hub-${Environment}"
           Id: HubEventBusExtTarget
           RoleArn: !GetAtt EventForwarderRole.Arn
 
@@ -194,7 +212,7 @@ Outputs:
 
   HubEventBusTarget:
     Description: Hub event bus receiving forwarded events
-    Value: !Sub "arn:aws:events:${HubRegion}:${HubAccountId}:event-bus/${ProjectName}-hub-${Environment}"
+    Value: !Sub "arn:${AWS::Partition}:events:${HubRegion}:${HubAccountId}:event-bus/${ProjectName}-hub-${Environment}"
 
   DeploymentNote:
     Description: What this stack deploys

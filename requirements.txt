@@ -6,8 +6,9 @@
 boto3>=1.26.0
 botocore
 
-# Provided in Lambda by the AWSSDKPandas-Python311 layer
+# Provided in Lambda by the AWSSDKPandas-Python314 layer
 pandas>=2.0.0
 pyarrow>=14.0.0
 
 pytest
+PyYAML  # template tests

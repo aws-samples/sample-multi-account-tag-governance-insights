@@ -14,7 +14,7 @@ single hub Lambda invocation using the org-wide aggregator view.
    `accountid:X region:Y` filters, scanning all member accounts from the hub account without per-account credentials
 2. **Hub-only Worker** — The Aggregator Worker runs only in the hub account; no StackSet deployment to member accounts
    needed for tag scanning
-3. **CloudFormation-native** — Fully deployed via CloudFormation, no Python environment needed
+3. **CloudFormation-native**: Fully deployed with CloudFormation. You need Python only to build the Lambda packages.
 4. **Delta-based** — Only changed resources are processed each scan, keeping costs and latency low
 5. **Parquet on S3** — All analytics data stored as Parquet for efficient Athena querying
 6. **Resumable scanning** — Coordinator tracks progress in `scan-checkpoint.json` and resumes across daily Lambda
@@ -51,35 +51,31 @@ Hub Account (your-hub-account-id)
 │
 ├── Monthly Aggregator Lambda  (ti-monthly-agg-ENV-ACCOUNT)
 │   ├── Triggered: day 2 of each month at 3 AM UTC
-│   ├── Reads 90-day-old daily partitions via Athena
-│   ├── Writes compressed monthly summaries to tag-deltas/historical/
-│   └── Deletes old daily partitions (90x partition reduction)
+│   ├── Picks the latest month that ended >= 28 days before the run
+│   ├── Athena UNLOAD of that month into tag-deltas/historical/
+│   └── Then deletes that month's daily partitions
 │
 ├── Central Analytics S3 Bucket  (ti-central-analytics-REGION-ENV-ACCOUNT)
 │   ├── aggregator-state/account_id={account}/region={region}/latest.json.gz
 │   ├── aggregator-state/scan-checkpoint.json
 │   ├── aggregator-state/completed/{scan_id}.json
 │   ├── deltas/account_id={account}/region={region}/{timestamp}-{scan_id}.json
-│   ├── tag-deltas/recent/       (Parquet, 90-day rolling, daily partitions)
+│   ├── tag-deltas/recent/       (Parquet, daily partitions, about the last 1-2 months)
 │   ├── tag-deltas/historical/   (Parquet, aggregated monthly)
-│   └── tag-costs/               (Parquet, CUR-matched cost data)
+│   └── tag-cost-allocation/     (Parquet, cost per resource, day, and tag)
 │
 ├── Glue Database  (ti_REGION_ENV_ACCOUNT)
 │   ├── resource_tag_deltas_recent   (external table)
 │   ├── resource_tag_deltas_historical (external table)
-│   └── tag_costs                    (external table)
+│   └── tag_cost_allocation          (external table, partition projection)
 │
 ├── Athena Workgroup  (ti-REGION-ENV-ACCOUNT)
 ├── Athena Results Bucket  (ti-athena-results-REGION-ENV-ACCOUNT)
 ├── Central SQS Queue  (ti-central-results-ENV-ACCOUNT)
 │
-├── Cost Analysis Pipeline (optional)
-│   ├── Cost Coordinator Lambda  (ti-cost-orches-ENV-ACCOUNT)
-│   │   └── Queries Athena for changed resources → batches to FIFO SQS
-│   ├── Cost Worker Lambda  (ti-cost-worker-ENV-ACCOUNT)
-│   │   └── Triggered by SQS → matches CUR costs → writes tag-costs/ Parquet
-│   └── Cost Deduplicator Lambda  (ti-cost-dedup-ENV-ACCOUNT)
-│       └── Triggered by SNS (queue empty alarm) → deduplicates daily → monthly
+├── Cost Analysis (optional)
+│   └── Cost Allocator Lambda  (ti-cost-alloc-ENV-ACCOUNT)
+│       └── Daily 06:00 UTC → joins CUR usage to tag history → UNLOADs tag-cost-allocation/ Parquet
 │
 └── Hub Event Bus  (ti-hub-ENV)
     └── Receives forwarded tag change events from member accounts (real-time path)
@@ -132,12 +128,16 @@ EventBridge StackSet → member accounts
    creation-time tags) or CloudTrail tag API event → EventBridge rule (member account)
    → Hub Event Bus → SQS buffer → Worker Lambda
    → Same delta/state/SQS notification flow as scan path
+   Delivery is unordered: changes seconds apart can arrive out of order, so the
+   delta history may briefly show a reverted value. The daily scan reconciles.
 
 6. MONTHLY COMPRESSION (day 2 of each month at 3 AM UTC)
    Monthly Aggregator Lambda
-   → Queries 90-day-old daily data via Athena
-   → Writes monthly Parquet to tag-deltas/historical/
-   → Deletes old daily partitions (90x partition count reduction)
+   → Target: the most recent calendar month that ended at least 28 days ago
+   → Athena UNLOAD into resource_tag_deltas_historical (tag-deltas/historical/)
+   → Deletes that month's daily partitions from tag-deltas/recent/
+   → A failed month is rerun by hand with {"year": Y, "month": M}
+     before tag-deltas/recent/ objects expire at 130 days
 ```
 
 ---
@@ -148,7 +148,7 @@ EventBridge StackSet → member accounts
 deployment/
 ├── core-stack.yaml            # S3 buckets, Glue DB + tables, Athena, SQS, EventBus
 ├── aggregator-stack.yaml      # Coordinator + Worker + Analytics Writer + Monthly Aggregator
-├── cost-analysis-stack.yaml   # Optional: CUR-based cost analysis (coordinator + worker + deduplicator)
+├── cost-analysis-stack.yaml   # Optional: CUR-based cost allocator (one Lambda, daily schedule)
 ├── deploy.yaml                # Root orchestration (CoreStack → AggregatorStack → optional CostAnalysisStack)
 └── templates/
     └── event-forwarder-stack.yaml  # StackSet template for member account event forwarding
@@ -238,22 +238,23 @@ RE local indexes enabled and linked to the aggregator.
 
 ## Athena Schema
 
-Four tables backed by Parquet on S3:
+Tables backed by Parquet on S3:
 
 | Table                            | S3 Prefix                | Partitions             | Retention                             |
 |----------------------------------|--------------------------|------------------------|---------------------------------------|
-| `resource_tag_deltas_recent`     | `tag-deltas/recent/`     | account/year/month/day | 95 days                               |
+| `resource_tag_deltas_recent`     | `tag-deltas/recent/`     | account/year/month/day | About 1-2 months (compacted monthly; 130-day expiry as a safety net) |
 | `resource_tag_deltas_historical` | `tag-deltas/historical/` | account/year/month     | Indefinite (IA after 90d)             |
-| `tag_costs`                      | `tag-costs/`             | account/year/month     | Per CUR data retention                |
+| `tag_cost_allocation`            | `tag-cost-allocation/`   | year/month (projection) | Current and previous month rewritten daily |
 
-**To run queries after first deployment**, register partitions. Select database `ti_REGION_ENV_ACCOUNT` in the Athena query editor first (these DDL
+**Partitions are registered automatically**: the Analytics Writer registers each daily partition and the Monthly Aggregator registers the monthly ones. Only if a registration failed (see the results DLQ) do you need to repair them. Select database `ti_REGION_ENV_ACCOUNT` in the Athena query editor first (these DDL
 statements use the selected database; the name is not double-quoted here):
 
 ```sql
 MSCK REPAIR TABLE resource_tag_deltas_recent;
 MSCK REPAIR TABLE resource_tag_deltas_historical;
-MSCK REPAIR TABLE tag_costs;
 ```
+
+`tag_cost_allocation` uses partition projection and doesn't need `MSCK REPAIR`.
 
 ---
 
@@ -282,7 +283,7 @@ All resources use the `ti-` prefix (short for TagInsights):
 | Storage format       | Apache Parquet (snappy compressed)                          | 10-100x compression vs JSON, columnar for Athena cost efficiency                          |
 | Analytics            | AWS Athena + Glue                                           | Serverless, no cluster management, pay-per-query                                          |
 | Deployment           | CloudFormation nested stacks + StackSet for event forwarder | Native multi-account, no additional tooling                                               |
-| Cost analysis        | CUR + Athena (primary); Cost Explorer (optional fallback)   | CUR preferred for cost and accuracy; CE disabled by default to prevent unexpected charges |
+| Cost analysis        | CUR + Athena (one `UNLOAD` per month)                       | Set-based join of CUR usage to tag history; no cost allocation tags needed                |
 
 ---
 

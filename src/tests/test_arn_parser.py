@@ -82,7 +82,7 @@ class TestParseArn:
                 "MyRole",
             ),
             # S3 with empty region and account
-            ("arn:aws:s3:::my-bucket", "s3", "", "", "", "my-bucket"),
+            ("arn:aws:s3:::amzn-s3-demo-bucket", "s3", "", "", "", "amzn-s3-demo-bucket"),
             # Lambda with function version (nested slash)
             (
                 "arn:aws:lambda:us-west-2:123456789012:function:my-function:1",
@@ -155,7 +155,7 @@ class TestParseArn:
         assert result is None
 
     def test_returns_named_tuple(self):
-        result = parse_arn("arn:aws:s3:::my-bucket")
+        result = parse_arn("arn:aws:s3:::amzn-s3-demo-bucket")
         assert isinstance(result, ARNComponents)
         # Verify named access works
         assert result.service == "s3"
@@ -205,7 +205,7 @@ class TestExtractServiceFromArn:
         [
             ("arn:aws:ec2:us-east-1:123:instance/i-1", "ec2"),
             ("arn:aws:lambda:us-east-1:123:function:f", "lambda"),
-            ("arn:aws:s3:::my-bucket", "s3"),
+            ("arn:aws:s3:::amzn-s3-demo-bucket", "s3"),
             ("arn:aws:iam::123:role/Admin", "iam"),
         ],
     )
@@ -310,7 +310,7 @@ class TestValidateArn:
     @pytest.mark.parametrize(
         "arn",
         [
-            "arn:aws:s3:::my-bucket",
+            "arn:aws:s3:::amzn-s3-demo-bucket",
             "arn:aws:ec2:us-east-1:123456789012:instance/i-1234",
             "arn:aws-cn:ec2:cn-north-1:123:instance/i-1",
             "arn:aws-us-gov:s3:us-gov-west-1:123:bucket/data",
@@ -337,10 +337,10 @@ class TestValidateArn:
         assert validate_arn(arn) is False, f"Expected False for: {reason}"
 
     def test_partition_aws(self):
-        assert validate_arn("arn:aws:s3:::bucket") is True
+        assert validate_arn("arn:aws:s3:::amzn-s3-demo-bucket") is True
 
     def test_partition_aws_cn(self):
-        assert validate_arn("arn:aws-cn:s3:::bucket") is True
+        assert validate_arn("arn:aws-cn:s3:::amzn-s3-demo-bucket") is True
 
     def test_partition_aws_us_gov(self):
-        assert validate_arn("arn:aws-us-gov:s3:::bucket") is True
+        assert validate_arn("arn:aws-us-gov:s3:::amzn-s3-demo-bucket") is True

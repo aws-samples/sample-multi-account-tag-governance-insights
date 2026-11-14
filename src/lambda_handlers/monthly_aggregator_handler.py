@@ -1,513 +1,337 @@
 """
 Monthly Aggregator Lambda Handler
 
-Runs monthly to aggregate 90-day-old daily data into monthly summaries.
-This reduces partition count and storage costs while maintaining query performance.
+Compacts one calendar month of daily tag deltas (resource_tag_deltas_recent,
+partitioned account_id/year/month/day) into one row per (account, arn) in
+resource_tag_deltas_historical (partitioned account_id/year/month), then
+deletes the compacted daily data.
 
-Architecture:
-- Triggered by: EventBridge schedule (monthly, day 2)
-- Reads from: resource_tag_deltas_recent (daily partitions)
-- Writes to: resource_tag_deltas_historical (monthly partitions)
-- Cleanup: Deletes old daily partitions after aggregation
-
-Partition Reduction:
-- Before: 1000 accounts × 90 days = 90,000 partitions
-- After: 1000 accounts × 1 month = 1,000 partitions (90x reduction)
+Flow (EventBridge cron, day 2 of each month; or {"year": Y, "month": M}):
+1. Target month = most recent month that ended >= 28 days before the run
+   (run on Nov 2 -> September; Mar 2 -> January, so February never skips one).
+2. List the month's recent partitions (Glue) and the accounts already compacted
+   (historical partitions registered). Registered historical partitions mark a
+   finished UNLOAD, so a rerun after a partial cleanup never recompacts a
+   partially-deleted month over complete data.
+3. For the remaining accounts, clear any orphaned historical output, then run
+   one Athena UNLOAD per <=100 accounts (UNLOAD's partition limit), all in
+   parallel, partitioned_by account_id/year/month. Athena writes typed Parquet
+   (maps stay maps, bigint/int stay numeric).
+4. Only after every UNLOAD SUCCEEDED and every partition registered, delete
+   the compacted daily objects and Glue partitions. Any failure raises so the
+   Lambda Errors alarm fires.
 """
 
 import json
+import logging
 import os
 import re
 import time
-import logging
-from datetime import datetime, timedelta
-from typing import Dict, List, Any
-from io import BytesIO
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import boto3
-from botocore.exceptions import ClientError
 
-# Optional dependencies
-try:
-    import pandas as pd
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-    HAS_PARQUET = True
-except ImportError:
-    HAS_PARQUET = False
-    logging.warning("Parquet libraries not available")
-
-# Configure logging
 logger = logging.getLogger()
 logger.setLevel(os.environ.get('LOG_LEVEL', 'INFO'))
 
-# AWS clients
 s3_client = boto3.client('s3')
 athena_client = boto3.client('athena')
 glue_client = boto3.client('glue')
 
-# Environment variables
-CENTRAL_ANALYTICS_BUCKET = os.environ.get('CENTRAL_ANALYTICS_BUCKET')
-ATHENA_RESULTS_BUCKET = os.environ.get('ATHENA_RESULTS_BUCKET')
-ATHENA_DATABASE = os.environ.get('ATHENA_DATABASE')
-ATHENA_WORKGROUP = os.environ.get('ATHENA_WORKGROUP')
-RETENTION_DAYS = int(os.environ.get('RETENTION_DAYS', '90'))
-ENVIRONMENT = os.environ.get('ENVIRONMENT', 'prod')
+RECENT_TABLE = 'resource_tag_deltas_recent'
+HISTORICAL_TABLE = 'resource_tag_deltas_historical'
+RECENT_PREFIX = 'tag-deltas/recent/'
+HISTORICAL_PREFIX = 'tag-deltas/historical/'
+
+MIN_YEAR, MAX_YEAR = 2020, 2100
+MIN_AGE_DAYS = 28            # month must have ended this long ago (see module docstring)
+UNLOAD_ACCOUNT_BATCH = 100   # Athena UNLOAD writes at most 100 partitions
+S3_DELETE_BATCH = 1000
+GLUE_CREATE_BATCH = 100
+GLUE_DELETE_BATCH = 25
+POLL_INTERVAL_SECONDS = 5
+DEFAULT_MAX_POLL_SECONDS = 600
+CLEANUP_BUFFER_SECONDS = 120  # time reserved after UNLOAD for registration + cleanup
+
+_BUCKET_RE = re.compile(r'^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$')
+_DATABASE_RE = re.compile(r'^[A-Za-z0-9_-]{1,255}$')
+_WORKGROUP_RE = re.compile(r'^[A-Za-z0-9._-]{1,128}$')
+_ACCOUNT_RE = re.compile(r'^\d{12}$')
+_DAY_IN_KEY_RE = re.compile(r'/day=(\d{1,2})/')
+
+# Historical Glue columns in table order -> aggregate over the month's deltas.
+# Last-state columns take the value of the latest delta; changed_by/event_name
+# carry the last non-null value (NULL if none).
+HISTORICAL_COLUMNS: List[Tuple[str, str]] = [
+    ('arn', 'arn'),
+    ('resource_type', 'max_by(resource_type, timestamp)'),
+    ('tags', 'max_by(tags, timestamp)'),
+    ('previous_tags', 'max_by(previous_tags, timestamp)'),
+    ('change_type', 'max_by(change_type, timestamp)'),
+    ('first_seen_timestamp', 'min(timestamp)'),
+    ('last_seen_timestamp', 'max(timestamp)'),
+    ('change_count', 'CAST(count(*) AS integer)'),
+    ('source_system', 'max_by(source_system, timestamp)'),
+    ('region', 'max_by(region, timestamp)'),
+    ('changed_by', 'max_by(changed_by, timestamp) FILTER (WHERE changed_by IS NOT NULL)'),
+    ('event_name', 'max_by(event_name, timestamp) FILTER (WHERE event_name IS NOT NULL)'),
+]
+PARTITION_COLUMNS = ['account_id', 'year', 'month']
+
+_PARQUET_SD = {
+    'InputFormat': 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat',
+    'OutputFormat': 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat',
+    'SerdeInfo': {
+        'SerializationLibrary': 'org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe',
+        'Parameters': {'serialization.format': '1'},
+    },
+}
 
 
-def lambda_handler(event, context):
-    """
-    Monthly aggregation handler
-    
-    Args:
-        event: Trigger event (EventBridge schedule or manual invoke)
-        context: Lambda context
-        
-    Returns:
-        Dict: Aggregation results
-    """
-    try:
-        logger.info("Monthly Aggregator started")
-        
-        # Determine which month to aggregate (90+ days ago)
-        target_date = datetime.now() - timedelta(days=RETENTION_DAYS + 5)  # Buffer
-        target_year = target_date.year
-        target_month = target_date.month
-        
-        logger.info(f"Aggregating data for {target_year}-{target_month:02d}")
-        
-        # Get list of accounts from recent table
-        accounts = discover_accounts(target_year, target_month)
-        logger.info(f"Found {len(accounts)} accounts to process")
-        
-        results = {
-            'target_year': target_year,
-            'target_month': target_month,
-            'accounts_processed': 0,
-            'accounts_failed': 0,
-            'total_deltas_aggregated': 0,
-            'partitions_deleted': 0
-        }
-        
-        # Process each account
-        for account_id in accounts:
-            try:
-                logger.info(f"Processing account: {account_id}")
-                
-                # Aggregate daily data to monthly
-                delta_count = aggregate_account_month(account_id, target_year, target_month)
-                
-                # Delete old daily partitions
-                deleted = delete_daily_partitions(account_id, target_year, target_month)
-                
-                results['accounts_processed'] += 1
-                results['total_deltas_aggregated'] += delta_count
-                results['partitions_deleted'] += deleted
-                
-                logger.info(f"Completed {account_id}: {delta_count} deltas, {deleted} partitions deleted")
-                
-            except Exception as e:
-                results['accounts_failed'] += 1
-                logger.error(f"Error processing account {account_id}: {str(e)}", exc_info=True)
-                # Continue with other accounts
-        
-        logger.info(f"Monthly aggregation completed: {results}")
-        return results
-        
-    except Exception as e:
-        logger.error(f"Fatal error in Monthly Aggregator: {str(e)}", exc_info=True)
-        raise
+def _config() -> Dict[str, str]:
+    """Read and validate identifiers that are interpolated into SQL / S3 paths."""
+    cfg = {
+        'bucket': os.environ.get('CENTRAL_ANALYTICS_BUCKET', ''),
+        'results_bucket': os.environ.get('ATHENA_RESULTS_BUCKET', ''),
+        'database': os.environ.get('ATHENA_DATABASE', ''),
+        'workgroup': os.environ.get('ATHENA_WORKGROUP', ''),
+    }
+    for key, pattern in (('bucket', _BUCKET_RE), ('results_bucket', _BUCKET_RE),
+                         ('database', _DATABASE_RE), ('workgroup', _WORKGROUP_RE)):
+        if not pattern.fullmatch(cfg[key]):
+            raise ValueError(f"Invalid or missing {key} configuration: {cfg[key]!r}")
+    return cfg
 
 
-def discover_accounts(year: int, month: int) -> List[str]:
-    """
-    Discover accounts that have data for the target month
-    
-    Args:
-        year: Target year
-        month: Target month
-        
-    Returns:
-        List[str]: List of account IDs
-    """
-    try:
-        # List partitions in recent table for this month
-        prefix = f"tag-deltas/recent/"
-        
-        # Use S3 list to find account_id directories
-        response = s3_client.list_objects_v2(
-            Bucket=CENTRAL_ANALYTICS_BUCKET,
-            Prefix=prefix,
-            Delimiter='/'
+def _validate_year_month(year: Any, month: Any) -> Tuple[int, int]:
+    for name, value, low, high in (('year', year, MIN_YEAR, MAX_YEAR), ('month', month, 1, 12)):
+        if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+            raise ValueError(f"Invalid {name}: {value!r} (expected int in {low}..{high})")
+    return year, month
+
+
+def target_month(event: Dict[str, Any], now: Optional[datetime] = None) -> Tuple[int, int]:
+    """Explicit {year, month} from the event, else the most recent month that
+    ended at least MIN_AGE_DAYS before now (UTC)."""
+    now = now or datetime.now(timezone.utc)
+    cutoff = now.astimezone(timezone.utc) - timedelta(days=MIN_AGE_DAYS)
+    if 'year' in event or 'month' in event:
+        year, month = _validate_year_month(event.get('year'), event.get('month'))
+        # Compacting marks the month's accounts done, and deltas for a month keep
+        # arriving after it ends (SQS redelivery, DLQ redrive). Those would be
+        # deleted by cleanup without being compacted, so the override gets the
+        # same MIN_AGE_DAYS margin as the scheduled run.
+        if (year, month) >= (cutoff.year, cutoff.month):
+            raise ValueError(f"Month {year}-{month:02d} has not ended {MIN_AGE_DAYS} days before now")
+        return year, month
+    # The month containing cutoff has not ended by cutoff; the one before it has.
+    year, month = (cutoff.year - 1, 12) if cutoff.month == 1 else (cutoff.year, cutoff.month - 1)
+    return _validate_year_month(year, month)
+
+
+def _chunks(items: List[Any], size: int) -> Iterable[List[Any]]:
+    for start in range(0, len(items), size):
+        yield items[start:start + size]
+
+
+def _historical_prefix(account_id: str, year: int, month: int) -> str:
+    return f"{HISTORICAL_PREFIX}account_id={account_id}/year={year}/month={month}/"
+
+
+def list_month_partitions(cfg: Dict[str, str], table: str, year: int, month: int) -> Dict[str, Set[int]]:
+    """{account_id: {day, ...}} for the month's Glue partitions (day empty for historical)."""
+    found: Dict[str, Set[int]] = {}
+    paginator = glue_client.get_paginator('get_partitions')
+    pages = paginator.paginate(
+        DatabaseName=cfg['database'], TableName=table,
+        Expression=f"year = {year} AND month = {month}",
+    )
+    for page in pages:
+        for partition in page.get('Partitions', []):
+            values = partition['Values']
+            if not _ACCOUNT_RE.fullmatch(values[0]):
+                logger.warning(f"Skipping partition with invalid account_id in {table}: {values!r}")
+                continue
+            days = found.setdefault(values[0], set())
+            if len(values) > 3:
+                days.add(int(values[3]))
+    return found
+
+
+def build_unload_sql(cfg: Dict[str, str], year: int, month: int, account_ids: List[str]) -> str:
+    """One set-based UNLOAD compacting the month for up to 100 accounts."""
+    _validate_year_month(year, month)
+    if not account_ids or len(account_ids) > UNLOAD_ACCOUNT_BATCH:
+        raise ValueError(f"UNLOAD batch must hold 1..{UNLOAD_ACCOUNT_BATCH} accounts")
+    for account_id in account_ids:
+        if not _ACCOUNT_RE.fullmatch(account_id):
+            raise ValueError(f"Invalid account_id: {account_id!r}")
+    if not _DATABASE_RE.fullmatch(cfg['database']) or not _BUCKET_RE.fullmatch(cfg['bucket']):
+        raise ValueError("Invalid database or bucket identifier")
+
+    select_list = ",\n       ".join(f"{expr} AS {name}" if expr != name else name
+                                   for name, expr in HISTORICAL_COLUMNS)
+    accounts = ", ".join(f"'{a}'" for a in account_ids)
+    partitions = ", ".join(f"'{c}'" for c in PARTITION_COLUMNS)
+    return f"""UNLOAD (
+SELECT {select_list},
+       account_id, year, month
+FROM "{cfg['database']}".{RECENT_TABLE}
+WHERE year = {year} AND month = {month}
+  AND account_id IN ({accounts})
+GROUP BY account_id, year, month, arn
+)
+TO 's3://{cfg['bucket']}/{HISTORICAL_PREFIX}'
+WITH (format = 'PARQUET', compression = 'SNAPPY', partitioned_by = ARRAY[{partitions}])"""  # nosec B608 - database/bucket regex-validated (database double-quoted); account_ids match \d{12}; year/month validated ints; column expressions are constants
+
+
+def delete_keys(cfg: Dict[str, str], keys: List[str]) -> None:
+    """Batch-delete keys; raise if S3 reports any per-key error."""
+    for batch in _chunks(keys, S3_DELETE_BATCH):
+        response = s3_client.delete_objects(
+            Bucket=cfg['bucket'],
+            Delete={'Objects': [{'Key': k} for k in batch], 'Quiet': True},
         )
-        
-        accounts = set()
-        
-        # Extract account IDs from common prefixes
-        for prefix_info in response.get('CommonPrefixes', []):
-            prefix_path = prefix_info['Prefix']
-            # Format: tag-deltas/recent/account_id=123456789012/
-            if 'account_id=' in prefix_path:
-                account_id = prefix_path.split('account_id=')[1].strip('/')
-                if re.fullmatch(r'\d{12}', account_id):
-                    accounts.add(account_id)
-                else:
-                    logger.warning(f"Skipping invalid account_id from S3 prefix: {account_id!r}")
-        
-        logger.info(f"Discovered {len(accounts)} accounts via S3 listing")
-        return list(accounts)
-        
-    except Exception as e:
-        logger.error(f"Error discovering accounts: {str(e)}")
-        # Fallback: query Athena
-        return discover_accounts_via_athena(year, month)
+        errors = response.get('Errors', [])
+        if errors:
+            raise RuntimeError(f"Failed to delete {len(errors)} of {len(batch)} objects: {errors[:3]}")
 
 
-def discover_accounts_via_athena(year: int, month: int) -> List[str]:
-    """Fallback: discover accounts via Athena query"""
+def list_keys(cfg: Dict[str, str], prefix: str) -> List[str]:
+    paginator = s3_client.get_paginator('list_objects_v2')
+    return [obj['Key']
+            for page in paginator.paginate(Bucket=cfg['bucket'], Prefix=prefix)
+            for obj in page.get('Contents', [])]
+
+
+def run_unloads(cfg: Dict[str, str], queries: List[str], deadline: float) -> List[str]:
+    """Start all UNLOADs, wait for all to SUCCEED; cancel the rest and raise otherwise.
+
+    Any error (a FAILED query, the deadline, or a start/poll API error) cancels
+    every started, unfinished UNLOAD: one left running would keep appending to
+    a prefix the retry clears and re-UNLOADs, duplicating historical rows."""
+    pending: List[str] = []
+    started: List[str] = []
     try:
-        query = f"""
-        SELECT DISTINCT account_id
-        FROM resource_tag_deltas_recent
-        WHERE year = {year} AND month = {month}
-        """  # nosec B608 - account_id matched to \d{12}; year/month are ints
-
-        results = execute_athena_query(query)
-        accounts = []
-        for row in results:
-            aid = row.get('account_id', '')
-            if re.fullmatch(r'\d{12}', aid):
-                accounts.append(aid)
-            else:
-                logger.warning(f"Skipping invalid account_id from Athena: {aid!r}")
-
-        logger.info(f"Discovered {len(accounts)} accounts via Athena")
-        return accounts
-
-    except Exception as e:
-        logger.error(f"Error discovering accounts via Athena: {str(e)}")
-        return []
-
-
-def aggregate_account_month(account_id: str, year: int, month: int) -> int:
-    """
-    Aggregate one month of daily data for one account into monthly summary
-    
-    Args:
-        account_id: AWS account ID
-        year: Target year
-        month: Target month
-        
-    Returns:
-        int: Number of delta records aggregated
-    """
-    if not re.fullmatch(r'\d{12}', account_id):
-        logger.error(f"Invalid account_id passed to aggregate_account_month: {account_id!r}")
-        return 0
-
-    try:
-        logger.info(f"Aggregating {account_id}/{year}/{month}")
-
-        # Query daily data for this account/month
-        query = f"""
-        SELECT 
-            arn,
-            resource_type,
-            tags,
-            previous_tags,
-            change_type,
-            MIN(timestamp) as first_seen_timestamp,
-            MAX(timestamp) as last_seen_timestamp,
-            COUNT(*) as change_count,
-            source_system,
-            region,
-            MAX(scan_id) as scan_id
-        FROM resource_tag_deltas_recent
-        WHERE account_id = '{account_id}'
-          AND year = {year}
-          AND month = {month}
-        GROUP BY 
-            arn, resource_type, tags, previous_tags,
-            change_type, source_system, region
-        """  # nosec B608 - account_id matched to \d{12}; year/month are ints
-        
-        # Execute query
-        results = execute_athena_query(query)
-        
-        if not results:
-            logger.info(f"No data found for {account_id}/{year}/{month}")
-            return 0
-        
-        logger.info(f"Aggregated {len(results)} records for {account_id}")
-        
-        # Write aggregated data to historical partition
-        write_monthly_aggregate(results, account_id, year, month)
-        
-        return len(results)
-        
-    except Exception as e:
-        logger.error(f"Error aggregating {account_id}/{year}/{month}: {str(e)}")
-        raise
-
-
-def execute_athena_query(query: str, timeout: int = 300) -> List[Dict]:
-    """
-    Execute Athena query and return results
-    
-    Args:
-        query: SQL query
-        timeout: Query timeout in seconds
-        
-    Returns:
-        List[Dict]: Query results
-    """
-    try:
-        # Start query execution
-        response = athena_client.start_query_execution(
-            QueryString=query,
-            QueryExecutionContext={'Database': ATHENA_DATABASE},
-            ResultConfiguration={
-                'OutputLocation': f's3://{ATHENA_RESULTS_BUCKET}/aggregator-queries/'
-            },
-            WorkGroup=ATHENA_WORKGROUP
-        )
-        
-        query_execution_id = response['QueryExecutionId']
-        logger.debug(f"Started Athena query: {query_execution_id}")
-        
-        # Wait for completion
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            execution_response = athena_client.get_query_execution(
-                QueryExecutionId=query_execution_id
+        for sql in queries:
+            response = athena_client.start_query_execution(
+                QueryString=sql,
+                QueryExecutionContext={'Database': cfg['database']},
+                ResultConfiguration={'OutputLocation': f"s3://{cfg['results_bucket']}/aggregator-queries/"},
+                WorkGroup=cfg['workgroup'],
             )
-            
-            status = execution_response['QueryExecution']['Status']['State']
-            
-            if status == 'SUCCEEDED':
-                # Get results
-                return get_query_results(query_execution_id)
-            elif status in ['FAILED', 'CANCELLED']:
-                error = execution_response['QueryExecution']['Status'].get('StateChangeReason', 'Unknown')
-                raise Exception(f"Query failed: {error}")
-            
-            time.sleep(2)
-        
-        raise Exception(f"Query timeout after {timeout} seconds")
-        
-    except Exception as e:
-        logger.error(f"Error executing Athena query: {str(e)}")
-        raise
+            pending.append(response['QueryExecutionId'])
+            started.append(response['QueryExecutionId'])
 
-
-def get_query_results(query_execution_id: str) -> List[Dict]:
-    """Get Athena query results"""
-    try:
-        results = []
-        paginator = athena_client.get_paginator('get_query_results')
-        
-        for page in paginator.paginate(QueryExecutionId=query_execution_id):
-            result_set = page['ResultSet']
-            
-            # Get column names from first row
-            if not results:
-                column_info = result_set['ResultSetMetadata']['ColumnInfo']
-                columns = [col['Name'] for col in column_info]
-            
-            # Parse data rows (skip header)
-            for row in result_set['Rows'][1:]:
-                row_data = {}
-                for i, cell in enumerate(row['Data']):
-                    if i < len(columns):
-                        row_data[columns[i]] = cell.get('VarCharValue', '')
-                results.append(row_data)
-        
-        return results
-        
-    except Exception as e:
-        logger.error(f"Error getting query results: {str(e)}")
-        raise
-
-
-def write_monthly_aggregate(data: List[Dict], account_id: str, year: int, month: int):
-    """
-    Write monthly aggregate to historical partition
-    
-    Args:
-        data: Aggregated data records
-        account_id: AWS account ID
-        year: Year
-        month: Month
-    """
-    try:
-        if not data:
-            return
-        
-        # Build partition path: account_id/year/month
-        partition_path = f"account_id={account_id}/year={year}/month={month}/"
-        
-        if HAS_PARQUET:
-            write_monthly_parquet(data, partition_path)
-        else:
-            write_monthly_json(data, partition_path)
-        
-        # Register partition with Glue
-        register_monthly_partition(account_id, year, month)
-        
-        logger.info(f"Wrote monthly aggregate: {partition_path}")
-        
-    except Exception as e:
-        logger.error(f"Error writing monthly aggregate: {str(e)}")
-        raise
-
-
-def write_monthly_parquet(data: List[Dict], partition_path: str):
-    """Write monthly aggregate as Parquet"""
-    try:
-        df = pd.DataFrame(data)
-        
-        # Convert to Parquet
-        table = pa.Table.from_pandas(df)
-        parquet_buffer = BytesIO()
-        pq.write_table(table, parquet_buffer, compression='snappy')
-        parquet_buffer.seek(0)
-        
-        # Write to S3
-        s3_key = f"tag-deltas/historical/{partition_path}monthly-aggregate.parquet"
-        
-        s3_client.put_object(
-            Bucket=CENTRAL_ANALYTICS_BUCKET,
-            Key=s3_key,
-            Body=parquet_buffer.getvalue(),
-            ContentType='application/octet-stream'
-        )
-        
-        logger.debug(f"Wrote monthly Parquet: {s3_key}")
-        
-    except Exception as e:
-        logger.error(f"Error writing monthly Parquet: {str(e)}")
-        raise
-
-
-def write_monthly_json(data: List[Dict], partition_path: str):
-    """Write monthly aggregate as JSON (fallback)"""
-    try:
-        s3_key = f"tag-deltas/historical/{partition_path}monthly-aggregate.json"
-        
-        s3_client.put_object(
-            Bucket=CENTRAL_ANALYTICS_BUCKET,
-            Key=s3_key,
-            Body=json.dumps(data),
-            ContentType='application/json'
-        )
-        
-        logger.debug(f"Wrote monthly JSON: {s3_key}")
-        
-    except Exception as e:
-        logger.error(f"Error writing monthly JSON: {str(e)}")
-        raise
-
-
-def register_monthly_partition(account_id: str, year: int, month: int):
-    """Register monthly partition with Glue"""
-    try:
-        partition_location = (
-            f"s3://{CENTRAL_ANALYTICS_BUCKET}/tag-deltas/historical/"
-            f"account_id={account_id}/year={year}/month={month}/"
-        )
-        
-        glue_client.create_partition(
-            DatabaseName=ATHENA_DATABASE,
-            TableName='resource_tag_deltas_historical',
-            PartitionInput={
-                'Values': [account_id, str(year), str(month)],
-                'StorageDescriptor': {
-                    'Location': partition_location,
-                    'InputFormat': 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat',
-                    'OutputFormat': 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat',
-                    'SerdeInfo': {
-                        'SerializationLibrary': 'org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe'
-                    }
-                }
-            }
-        )
-        
-        logger.debug(f"Registered monthly partition: {account_id}/{year}/{month}")
-        
-    except glue_client.exceptions.AlreadyExistsException:
-        logger.debug(f"Monthly partition already exists: {account_id}/{year}/{month}")
-    except Exception as e:
-        logger.warning(f"Could not register monthly partition: {str(e)}")
-
-
-def delete_daily_partitions(account_id: str, year: int, month: int) -> int:
-    """
-    Delete daily partitions for the aggregated month
-    
-    Args:
-        account_id: AWS account ID
-        year: Year
-        month: Month
-        
-    Returns:
-        int: Number of partitions deleted
-    """
-    try:
-        deleted_count = 0
-        
-        # Delete each day's partition
-        for day in range(1, 32):  # Max days in month
+        while pending:
+            for qid in list(pending):
+                status = athena_client.get_query_execution(QueryExecutionId=qid)['QueryExecution']['Status']
+                state = status['State']
+                if state == 'SUCCEEDED':
+                    pending.remove(qid)
+                elif state in ('FAILED', 'CANCELLED'):
+                    pending.remove(qid)
+                    raise RuntimeError(f"UNLOAD {qid} {state}: {status.get('StateChangeReason', 'Unknown')}")
+            if not pending:
+                break
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"UNLOAD queries {pending} not finished before deadline; cancelled")
+            time.sleep(POLL_INTERVAL_SECONDS)
+    except Exception:
+        for qid in pending:
             try:
-                # Drop partition from Glue
-                glue_client.delete_partition(
-                    DatabaseName=ATHENA_DATABASE,
-                    TableName='resource_tag_deltas_recent',
-                    PartitionValues=[account_id, str(year), str(month), str(day)]
-                )
-                
-                # Delete S3 data
-                prefix = (
-                    f"tag-deltas/recent/account_id={account_id}/"
-                    f"year={year}/month={month}/day={day}/"
-                )
-                
-                delete_s3_prefix(prefix)
-                
-                deleted_count += 1
-                logger.debug(f"Deleted partition: {account_id}/{year}/{month}/{day}")
-                
-            except glue_client.exceptions.EntityNotFoundException:
-                # Partition doesn't exist (not all days have data)
-                pass
-            except Exception as e:
-                logger.warning(f"Error deleting partition {account_id}/{year}/{month}/{day}: {str(e)}")
-        
-        logger.info(f"Deleted {deleted_count} daily partitions for {account_id}/{year}/{month}")
-        return deleted_count
-        
-    except Exception as e:
-        logger.error(f"Error deleting daily partitions: {str(e)}")
-        return 0
-
-
-def delete_s3_prefix(prefix: str):
-    """Delete all objects under S3 prefix"""
-    try:
-        # List objects
-        paginator = s3_client.get_paginator('list_objects_v2')
-        
-        for page in paginator.paginate(Bucket=CENTRAL_ANALYTICS_BUCKET, Prefix=prefix):
-            objects = page.get('Contents', [])
-            
-            if objects:
-                # Batch delete
-                delete_keys = [{'Key': obj['Key']} for obj in objects]
-                s3_client.delete_objects(
-                    Bucket=CENTRAL_ANALYTICS_BUCKET,
-                    Delete={'Objects': delete_keys}
-                )
-                logger.debug(f"Deleted {len(delete_keys)} objects from {prefix}")
-        
-    except Exception as e:
-        logger.error(f"Error deleting S3 prefix {prefix}: {str(e)}")
+                athena_client.stop_query_execution(QueryExecutionId=qid)
+            except Exception as e:  # best effort; the original failure is what we raise
+                logger.warning(f"Could not cancel UNLOAD {qid}: {e}")
         raise
+    return started
+
+
+def register_partitions(cfg: Dict[str, str], account_ids: List[str], year: int, month: int) -> None:
+    """Register historical partitions; raise on any error other than AlreadyExists."""
+    for batch in _chunks(account_ids, GLUE_CREATE_BATCH):
+        response = glue_client.batch_create_partition(
+            DatabaseName=cfg['database'], TableName=HISTORICAL_TABLE,
+            PartitionInputList=[{
+                'Values': [a, str(year), str(month)],
+                'StorageDescriptor': {**_PARQUET_SD,
+                                      'Location': f"s3://{cfg['bucket']}/{_historical_prefix(a, year, month)}"},
+            } for a in batch],
+        )
+        errors = [e for e in response.get('Errors', [])
+                  if e.get('ErrorDetail', {}).get('ErrorCode') != 'AlreadyExistsException']
+        if errors:
+            raise RuntimeError(f"Failed to register {len(errors)} historical partitions: {errors[:3]}")
+
+
+def delete_recent_month(cfg: Dict[str, str], recent: Dict[str, Set[int]], year: int, month: int) -> Dict[str, int]:
+    """Delete the compacted daily objects and Glue partitions. Attempts every
+    account, then raises if anything failed (rerun resumes: historical is registered)."""
+    objects = partitions = 0
+    failures = []
+    for account_id, days in sorted(recent.items()):
+        try:
+            prefix = f"{RECENT_PREFIX}account_id={account_id}/year={year}/month={month}/"
+            keys = [k for k in list_keys(cfg, prefix)
+                    if (m := _DAY_IN_KEY_RE.search(k[len(prefix) - 1:])) and int(m.group(1)) in days]
+            delete_keys(cfg, keys)
+            objects += len(keys)
+            for batch in _chunks(sorted(days), GLUE_DELETE_BATCH):
+                response = glue_client.batch_delete_partition(
+                    DatabaseName=cfg['database'], TableName=RECENT_TABLE,
+                    PartitionsToDelete=[{'Values': [account_id, str(year), str(month), str(d)]} for d in batch],
+                )
+                errors = [e for e in response.get('Errors', [])
+                          if e.get('ErrorDetail', {}).get('ErrorCode') != 'EntityNotFoundException']
+                if errors:
+                    raise RuntimeError(f"Failed to delete {len(errors)} recent partitions: {errors[:3]}")
+                partitions += len(batch)
+        except Exception as e:
+            logger.error(f"Cleanup failed for account {account_id} {year}-{month:02d}: {e}")
+            failures.append(account_id)
+    if failures:
+        raise RuntimeError(f"Daily cleanup failed for {len(failures)} accounts: {failures[:10]}")
+    return {'objects_deleted': objects, 'partitions_deleted': partitions}
+
+
+def _max_poll_seconds(context) -> float:
+    remaining_ms = getattr(context, 'get_remaining_time_in_millis', None)
+    if callable(remaining_ms):
+        return max(remaining_ms() / 1000 - CLEANUP_BUFFER_SECONDS, POLL_INTERVAL_SECONDS)
+    return DEFAULT_MAX_POLL_SECONDS
+
+
+def lambda_handler(event, context, now: Optional[datetime] = None):
+    """Compact one month of daily deltas into historical monthly rows."""
+    event = event or {}
+    logger.info(f"Monthly Aggregator started: {json.dumps(event, default=str)}")
+    cfg = _config()
+    year, month = target_month(event, now)
+    deadline = time.monotonic() + _max_poll_seconds(context)
+
+    recent = list_month_partitions(cfg, RECENT_TABLE, year, month)
+    done = set(list_month_partitions(cfg, HISTORICAL_TABLE, year, month))
+    todo = sorted(set(recent) - done)
+    logger.info(f"{year}-{month:02d}: {len(recent)} accounts with daily data, "
+                f"{len(recent) - len(todo)} already compacted, {len(todo)} to compact")
+
+    # UNLOAD into partitions appends, so clear orphaned output of earlier failed runs.
+    for account_id in todo:
+        delete_keys(cfg, list_keys(cfg, _historical_prefix(account_id, year, month)))
+
+    queries = [build_unload_sql(cfg, year, month, batch) for batch in _chunks(todo, UNLOAD_ACCOUNT_BATCH)]
+    query_ids = run_unloads(cfg, queries, deadline) if queries else []
+    register_partitions(cfg, todo, year, month)
+    cleanup = delete_recent_month(cfg, recent, year, month)
+
+    result = {
+        'target_year': year,
+        'target_month': month,
+        'accounts_compacted': len(todo),
+        'accounts_already_compacted': len(recent) - len(todo),
+        'query_execution_ids': query_ids,
+        **cleanup,
+    }
+    logger.info(f"Monthly aggregation completed: {result}")
+    return result
